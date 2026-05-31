@@ -1,0 +1,28 @@
+[project]
+name = "newtonspect-backend"
+version = "0.1.0"
+description = "NewtonSpect backend for automatic subtitling and video analytics"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.116.0",
+  "uvicorn[standard]>=0.31.0",
+  "python-multipart>=0.0.10",
+  "pydantic>=2.9.0",
+  "numpy>=1.26.0",
+  "opencv-python>=4.10.0",
+  "openvino>=2024.4.0",
+  "faster-whisper>=1.1.0",
+  "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3.0",
+  "pytest-mock>=3.14.0",
+  "httpx>=0.28.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

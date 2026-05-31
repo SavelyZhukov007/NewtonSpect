@@ -1,0 +1,35 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data
+storage/
+*.log
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Local env
+.env
+.env.local
+.env.*
+!.env.example
