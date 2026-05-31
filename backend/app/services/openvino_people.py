@@ -7,7 +7,10 @@ from typing import Any
 
 import cv2
 import numpy as np
-from openvino.runtime import Core
+try:
+    from openvino import Core
+except ImportError:  # pragma: no cover
+    from openvino.runtime import Core
 
 from ..schemas import PersonProfile, PersonTrackStats
 from .types import FaceTrackSample, VisionAnalysisResult
@@ -266,4 +269,3 @@ class OpenVINOPeopleAnalyzer:
         lap = cv2.Laplacian(lower, cv2.CV_32F)
         energy = float(np.mean(np.abs(lap)))
         return math.tanh(energy / 80.0)
-

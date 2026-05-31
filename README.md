@@ -30,49 +30,48 @@ Pipeline stages:
 
 ## Quick Start
 
-### 1) Backend setup
+Use the unified root script `build.py`.
+
+### 1) Install dependencies (backend + frontend)
 
 ```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m pip install -e ".[test]"
+python build.py setup
 ```
 
-### 2) Frontend setup
+### 2) Run checks (backend tests + frontend lint)
 
 ```powershell
-cd frontend
-npm install
+python build.py check
 ```
 
-### 3) Run services (3 terminals)
-
-API:
+### 3) Build frontend bundle
 
 ```powershell
-cd backend
-.\.venv\Scripts\Activate.ps1
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+python build.py build
 ```
 
-Worker:
+### 4) Run full local stack (API + worker + frontend)
 
 ```powershell
-cd backend
-.\.venv\Scripts\Activate.ps1
-python worker.py
+python build.py run
 ```
 
-Frontend:
+Open UI: `http://127.0.0.1:5173`
+
+### One-command dev flow
+
+`dev` runs setup, checks, then starts all services:
 
 ```powershell
-cd frontend
-npm run dev
+python build.py dev
 ```
 
-Open: `http://127.0.0.1:5173`
+### Useful flags
+
+- `python build.py run --no-setup` - run stack without reinstalling dependencies
+- `python build.py run --no-reload` - disable uvicorn autoreload
+- `python build.py check --skip-frontend-lint` - run only backend checks
+- `python build.py build --skip-checks` - build frontend without tests/lint
 
 ## Environment variables
 
@@ -118,9 +117,13 @@ If models are absent, the service falls back to Haar + histogram mode and still 
 ## Tests
 
 ```powershell
-cd backend
-python -m pytest -q
+python build.py check
 ```
+
+## Legacy scripts
+
+`scripts/run_api.ps1`, `scripts/run_worker.ps1`, and `scripts/run_frontend.ps1` are kept as optional manual launch helpers.  
+Primary workflow is `build.py`.
 
 ## Current V1 scope
 
@@ -132,4 +135,3 @@ python -m pytest -q
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
