@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..schemas import TranscriptSegment
 
@@ -33,6 +33,7 @@ class ASRService:
         language: str | None,
         auto_detect_language: bool,
         quality_preset: str,
+        progress_callback: Callable[[float, float, float], None] | None = None,
     ) -> list[TranscriptSegment]:
         model = self._load_model(quality_preset=quality_preset)
         task_kwargs: dict[str, Any] = {
@@ -43,12 +44,16 @@ class ASRService:
         if not auto_detect_language and language:
             task_kwargs["language"] = language
 
-        segments_iter, _info = model.transcribe(str(audio_path), **task_kwargs)
+        segments_iter, info = model.transcribe(str(audio_path), **task_kwargs)
+        total_audio_seconds = float(getattr(info, "duration", 0.0) or 0.0)
         parsed: list[TranscriptSegment] = []
         for seg in segments_iter:
             text = (seg.text or "").strip()
             if not text:
                 continue
+            if progress_callback is not None and total_audio_seconds > 0:
+                processed = min(float(seg.end), total_audio_seconds)
+                progress_callback(processed, total_audio_seconds, max(total_audio_seconds - processed, 0.0))
             parsed.append(
                 TranscriptSegment(
                     start=float(seg.start),
@@ -67,4 +72,3 @@ class ASRService:
                 )
             )
         return parsed
-

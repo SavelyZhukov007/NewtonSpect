@@ -1,81 +1,128 @@
 # NewtonSpect
 
-Local platform for automatic video subtitling and video intelligence:
+NewtonSpect is a local `frontend + backend + worker` platform for automatic subtitling and video analytics.
 
-- Speech-to-text via `faster-whisper` (`large-v3` by default)
-- Subtitle export: `SRT`, `VTT`, `ASS`
-- Burned subtitles export: `MP4`
-- OpenVINO-based people analysis with unique person clustering
-- Speaker attribution (ASD-first contract + robust fallback)
-- AI summary generation through local Ollama (`qwen2.5:3b`)
+Core stack:
+
+- ASR: `faster-whisper` + `openai/whisper-large-v3`
+- Summary: local Ollama `qwen2.5:3b`
+- Vision: OpenVINO (NCS2-ready with `MYRIAD -> CPU` fallback)
+- Queue/storage: SQLite + artifact filesystem
+
+## What V1 does
+
+- Upload video and process it in background (UI never blocks)
+- Real per-stage runtime telemetry:
+  - stage progress in %
+  - live speed
+  - ETA
+- RU/EN localization switch in UI
+- Feature toggles per job (enable/disable parts of pipeline)
+- Mobile-ready UI for iPhone/Android uploads and downloads
+- Storage page (job library) to open old jobs and re-download artifacts
+- Job author tagged by detected device from `User-Agent`
+- Exports:
+  - subtitles: `SRT`, `VTT`, `ASS`
+  - video with burned subtitles: `MP4`
+  - optional masked video with OpenVINO overlays
+  - ZIP bundle
 
 ## Architecture
 
-- `backend/`: FastAPI API + SQLite queue metadata + pipeline services
-- `backend/worker.py`: background worker (polling queue)
-- `frontend/`: React + Vite + TypeScript UI
-- `storage/`: runtime artifacts (`uploads`, `jobs`, db file)
+- `backend/`: FastAPI API + queue repository + pipeline services
+- `backend/worker.py`: background poller worker
+- `frontend/`: React + Vite + TypeScript
+- `storage/`: DB, uploads, generated artifacts
+- `build.py`: one-file setup/check/build/run entrypoint
 
 Pipeline stages:
 
-`ingest -> audio_extract -> asr -> subtitle_postprocess -> vision -> speaker_attribution -> report -> burned_video`
+`ingest -> audio_extract -> asr -> subtitle_postprocess -> vision -> speaker_attribution -> report -> burned_video -> mask_overlay -> done`
 
 ## Requirements
 
 - Python `3.10+`
 - Node.js `20+`
-- `ffmpeg` available in PATH
+- `ffmpeg` in PATH
 - Ollama with `qwen2.5:3b` pulled locally
-- OpenVINO runtime installed (NCS2 optional)
+- OpenVINO runtime installed
 
-## Quick Start
+## Quick start
 
-Use the unified root script `build.py`.
-
-### 1) Install dependencies (backend + frontend)
+1) Setup dependencies:
 
 ```powershell
 python build.py setup
 ```
 
-### 2) Run checks (backend tests + frontend lint)
+2) Run checks:
 
 ```powershell
 python build.py check
 ```
 
-### 3) Build frontend bundle
+3) Build frontend:
 
 ```powershell
 python build.py build
 ```
 
-### 4) Run full local stack (API + worker + frontend)
+4) Run full stack:
 
 ```powershell
 python build.py run
 ```
 
-Open UI: `http://127.0.0.1:5173`
+UI default: `http://127.0.0.1:5173`
 
-### One-command dev flow
-
-`dev` runs setup, checks, then starts all services:
+One-command flow:
 
 ```powershell
 python build.py dev
 ```
 
-### Useful flags
+Useful flags:
 
-- `python build.py run --no-setup` - run stack without reinstalling dependencies
-- `python build.py run --no-reload` - disable uvicorn autoreload
-- `python build.py check --skip-frontend-lint` - run only backend checks
-- `python build.py build --skip-checks` - build frontend without tests/lint
+- `python build.py run --no-setup`
+- `python build.py run --no-reload`
+- `python build.py check --skip-frontend-lint`
+- `python build.py build --skip-checks`
+
+## API
+
+- `POST /api/v1/jobs` - upload and create job
+- `GET /api/v1/jobs` - storage/library job list
+- `GET /api/v1/jobs/{job_id}` - status, progress, runtime telemetry
+- `GET /api/v1/jobs/{job_id}/artifacts` - artifacts list
+- `GET /api/v1/jobs/{job_id}/people` - unique people + portraits + stats
+- `GET /api/v1/jobs/{job_id}/report` - generated summary/report
+- `POST /api/v1/jobs/{job_id}/export` - build ZIP bundle
+- `GET /api/v1/jobs/{job_id}/artifacts/{artifact_name}/download` - file download
+
+## OpenVINO models for mask mode
+
+When `enable_mask_overlay=true`, pipeline tries these models (if present):
+
+- `age-gender-recognition-retail-0013`
+- `emotions-recognition-retail-0003`
+- `face-detection-retail-0004`
+- `face-reidentification-retail-0095`
+- `facial-landmarks-35-adas-0002`
+- `facial-landmarks-98-detection-0001`
+- `human-pose-estimation-0001`
+- `person-detection-retail-0013`
+- `person-reidentification-retail-0277`
+
+Model directory:
+
+`<storage>/models/openvino/**`
+
+Device policy:
+
+- tries `MYRIAD` first (Intel NCS2)
+- falls back to `CPU`
 
 ## Environment variables
-
-Optional env vars:
 
 - `NEWTONSPECT_STORAGE_ROOT` (default: `storage`)
 - `NEWTONSPECT_DB_PATH` (default: `<storage>/newtonspect.db`)
@@ -87,50 +134,17 @@ Optional env vars:
 - `NEWTONSPECT_WORKER_POLL_SECONDS` (default: `2.0`)
 - `NEWTONSPECT_WORKER_STUCK_TIMEOUT_SECONDS` (default: `900`)
 
-## API endpoints
+Hugging Face stability/performance:
 
-- `POST /api/v1/jobs` - upload video and create processing job
-- `GET /api/v1/jobs/{job_id}` - job status/progress
-- `GET /api/v1/jobs/{job_id}/artifacts` - artifact list
-- `GET /api/v1/jobs/{job_id}/people` - unique people profiles
-- `GET /api/v1/jobs/{job_id}/report` - AI summary/report payload
-- `POST /api/v1/jobs/{job_id}/export` - build ZIP bundle
-- `GET /api/v1/jobs/{job_id}/artifacts/{artifact_name}/download` - download file
-
-## OpenVINO model notes
-
-The service attempts device order from `NEWTONSPECT_OPENVINO_DEVICES`.
-Default order: `MYRIAD` (NCS2) then fallback to `CPU`.
-
-Place OpenVINO IR files under:
-
-`<storage>/models/openvino/**`
-
-Expected model file names:
-
-- `face-detection-retail-0005.xml`
-- `landmarks-regression-retail-0009.xml`
-- `face-reidentification-retail-0095.xml`
-
-If models are absent, the service falls back to Haar + histogram mode and still completes pipeline.
+- `HF_TOKEN` (recommended) for higher Hub rate limits
+- `HF_HUB_DISABLE_SYMLINKS_WARNING=1` to hide symlink warning text
+- On Windows, enable Developer Mode to allow symlink cache optimization
 
 ## Tests
 
 ```powershell
 python build.py check
 ```
-
-## Legacy scripts
-
-`scripts/run_api.ps1`, `scripts/run_worker.ps1`, and `scripts/run_frontend.ps1` are kept as optional manual launch helpers.  
-Primary workflow is `build.py`.
-
-## Current V1 scope
-
-- Local single-node execution (no auth, no cloud orchestration)
-- Persistent SQLite queue
-- People block with portrait + key comments
-- Markdown summary and LaTeX blocks (if generated by model)
 
 ## License
 

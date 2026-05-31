@@ -22,6 +22,42 @@ class JobOptions(BaseModel):
     detect_people: bool = True
     generate_summary: bool = True
     enable_active_speaker_model: bool = True
+    enable_mask_overlay: bool = False
+    mask_model_names: list[str] = Field(
+        default_factory=lambda: [
+            "age-gender-recognition-retail-0013",
+            "emotions-recognition-retail-0003",
+            "face-detection-retail-0004",
+            "face-reidentification-retail-0095",
+            "facial-landmarks-35-adas-0002",
+            "facial-landmarks-98-detection-0001",
+            "human-pose-estimation-0001",
+            "person-detection-retail-0013",
+            "person-reidentification-retail-0277",
+        ]
+    )
+    enable_subtitles: bool = True
+    enable_burned_video: bool = True
+    ui_locale: Literal["ru", "en"] = "en"
+
+
+class StageRuntime(BaseModel):
+    step: str
+    progress: float = 0.0
+    speed: float | None = None
+    speed_unit: str | None = None
+    eta_seconds: float | None = None
+    message: str | None = None
+    started_at: datetime | None = None
+    updated_at: datetime | None = None
+    completed: bool = False
+
+
+class JobRuntime(BaseModel):
+    stages: dict[str, StageRuntime] = Field(default_factory=dict)
+    overall_eta_seconds: float | None = None
+    current_speed: float | None = None
+    current_speed_unit: str | None = None
 
 
 class Artifact(BaseModel):
@@ -66,12 +102,15 @@ class VideoReport(BaseModel):
 class JobView(BaseModel):
     id: str
     original_filename: str
+    created_by_device: str = "Unknown device"
+    locale: Literal["ru", "en"] = "en"
     status: JobStatus
     progress: float
     current_step: str | None = None
     error_message: str | None = None
     options: JobOptions
     artifacts: list[Artifact] = Field(default_factory=list)
+    runtime: JobRuntime = Field(default_factory=JobRuntime)
     created_at: datetime
     updated_at: datetime
 
@@ -98,3 +137,6 @@ class ReportResponse(BaseModel):
 class ExportRequest(BaseModel):
     formats: list[ExportFormat]
 
+
+class JobLibraryResponse(BaseModel):
+    items: list[JobView]

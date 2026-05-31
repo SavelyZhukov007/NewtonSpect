@@ -40,6 +40,9 @@ def init_db(db_path: Path) -> None:
                 artifacts_json TEXT NOT NULL DEFAULT '[]',
                 people_json TEXT NOT NULL DEFAULT '[]',
                 report_json TEXT NOT NULL DEFAULT '{}',
+                runtime_json TEXT NOT NULL DEFAULT '{}',
+                created_by_device TEXT NOT NULL DEFAULT 'Unknown device',
+                locale TEXT NOT NULL DEFAULT 'en',
                 worker_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -60,4 +63,20 @@ def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_task_events_job_created ON task_events(job_id, created_at);
             """
         )
+        _ensure_jobs_columns(conn)
 
+
+def _ensure_jobs_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+
+    if "runtime_json" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN runtime_json TEXT NOT NULL DEFAULT '{}'")
+    if "created_by_device" not in existing:
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN created_by_device TEXT NOT NULL DEFAULT 'Unknown device'"
+        )
+    if "locale" not in existing:
+        conn.execute("ALTER TABLE jobs ADD COLUMN locale TEXT NOT NULL DEFAULT 'en'")

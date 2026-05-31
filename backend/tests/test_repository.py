@@ -15,6 +15,8 @@ def test_repository_queue_and_claim(tmp_path: Path) -> None:
         original_filename="video.mp4",
         input_video_path=str(tmp_path / "video.mp4"),
         options=JobOptions(),
+        created_by_device="Windows",
+        locale="en",
     )
     job = repo.get_job("job-1")
     assert job is not None
@@ -30,4 +32,4 @@ def test_repository_queue_and_claim(tmp_path: Path) -> None:
     assert updated is not None
     assert updated.progress == 0.5
     assert updated.current_step == "asr"
-
+    assert updated.created_by_device == "Windows"

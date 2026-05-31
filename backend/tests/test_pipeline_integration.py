@@ -18,6 +18,8 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
         original_filename="demo.mp4",
         input_video_path=str(video_path),
         options=options,
+        created_by_device="Windows",
+        locale="en",
     )
     job = container.repository.get_job("job-e2e")
     assert job is not None
@@ -34,7 +36,9 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
             TranscriptSegment(start=2.1, end=3.8, text="Еще одна фраза", confidence=0.8),
         ]
 
-    def fake_analyze(_video: Path, people_output_dir: Path) -> VisionAnalysisResult:
+    def fake_analyze(_video: Path, people_output_dir: Path, progress_callback=None) -> VisionAnalysisResult:
+        if progress_callback:
+            progress_callback(10, 10, 1.0)
         portrait = people_output_dir / "P001.jpg"
         portrait.parent.mkdir(parents=True, exist_ok=True)
         portrait.write_bytes(b"\xff\xd8\xff\xd9")
@@ -64,8 +68,11 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
             raw_markdown="",
         )
 
-    def fake_burn(_video: Path, ass_path: Path, output_video: Path) -> Path:
+    def fake_burn(_video: Path, ass_path: Path, output_video: Path, duration_seconds: float, progress_callback=None) -> Path:
         _ = ass_path
+        _ = duration_seconds
+        if progress_callback:
+            progress_callback(2.0, 2.0, 0.0)
         output_video.write_bytes(b"fake mp4")
         return output_video
 
@@ -73,7 +80,7 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(pipeline.asr, "transcribe", fake_transcribe)
     monkeypatch.setattr(pipeline.people_analyzer, "analyze", fake_analyze)
     monkeypatch.setattr(pipeline.report_generator, "generate", fake_report)
-    monkeypatch.setattr(pipeline.media, "burn_ass_subtitles", fake_burn)
+    monkeypatch.setattr(pipeline.media, "burn_ass_subtitles_with_progress", fake_burn)
 
     pipeline.process(job)
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -54,7 +55,12 @@ class OpenVINOPeopleAnalyzer:
         )
         self._next_person_index = 1
 
-    def analyze(self, video_path: Path, people_output_dir: Path) -> VisionAnalysisResult:
+    def analyze(
+        self,
+        video_path: Path,
+        people_output_dir: Path,
+        progress_callback: Callable[[int, int, float], None] | None = None,
+    ) -> VisionAnalysisResult:
         people_output_dir.mkdir(parents=True, exist_ok=True)
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -63,6 +69,8 @@ class OpenVINOPeopleAnalyzer:
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps = fps if fps and fps > 0 else 25.0
         sample_every = max(int(fps // 2), 1)  # ~2 FPS for cost control
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        started = time.perf_counter()
 
         accumulators: dict[str, _PersonAccumulator] = {}
         samples: list[FaceTrackSample] = []
@@ -107,6 +115,9 @@ class OpenVINOPeopleAnalyzer:
                         mouth_activity=mouth_activity,
                     )
                 )
+            if progress_callback is not None:
+                elapsed = max(time.perf_counter() - started, 1e-6)
+                progress_callback(frame_idx + 1, total_frames, elapsed)
             frame_idx += 1
         cap.release()
 

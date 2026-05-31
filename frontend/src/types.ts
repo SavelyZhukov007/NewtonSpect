@@ -11,6 +11,30 @@ export interface JobOptions {
   detect_people: boolean
   generate_summary: boolean
   enable_active_speaker_model: boolean
+  enable_mask_overlay: boolean
+  mask_model_names: string[]
+  enable_subtitles: boolean
+  enable_burned_video: boolean
+  ui_locale: 'ru' | 'en'
+}
+
+export interface StageRuntime {
+  step: string
+  progress: number
+  speed: number | null
+  speed_unit: string | null
+  eta_seconds: number | null
+  message: string | null
+  started_at: string | null
+  updated_at: string | null
+  completed: boolean
+}
+
+export interface JobRuntime {
+  stages: Record<string, StageRuntime>
+  overall_eta_seconds: number | null
+  current_speed: number | null
+  current_speed_unit: string | null
 }
 
 export interface Artifact {
@@ -24,12 +48,15 @@ export interface Artifact {
 export interface JobView {
   id: string
   original_filename: string
+  created_by_device: string
+  locale: 'ru' | 'en'
   status: JobStatus
   progress: number
   current_step: string | null
   error_message: string | null
   options: JobOptions
   artifacts: Artifact[]
+  runtime: JobRuntime
   created_at: string
   updated_at: string
 }
@@ -57,3 +84,6 @@ export interface VideoReport {
   raw_markdown: string
 }
 
+export interface JobLibraryResponse {
+  items: JobView[]
+}

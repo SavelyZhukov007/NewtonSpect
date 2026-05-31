@@ -13,7 +13,9 @@ from ..schemas import (
     ArtifactsResponse,
     CreateJobResponse,
     ExportRequest,
+    JobLibraryResponse,
     JobOptions,
+    JobRuntime,
     JobView,
     PeopleResponse,
     ReportResponse,
@@ -34,15 +36,35 @@ def _to_job_view(container: Container, job_id: str) -> JobView:
     return JobView(
         id=job.id,
         original_filename=job.original_filename,
+        created_by_device=job.created_by_device,
+        locale=job.locale,  # type: ignore[arg-type]
         status=job.status,  # type: ignore[arg-type]
         progress=job.progress,
         current_step=job.current_step,
         error_message=job.error_message,
         options=container.repository.decode_options(job.options_json),
         artifacts=container.repository.decode_artifacts(job.artifacts_json),
+        runtime=container.repository.decode_runtime(job.runtime_json),
         created_at=datetime.fromisoformat(job.created_at),
         updated_at=datetime.fromisoformat(job.updated_at),
     )
+
+
+def _device_label(user_agent: str | None) -> str:
+    ua = (user_agent or "").lower()
+    if "iphone" in ua:
+        return "iPhone"
+    if "ipad" in ua:
+        return "iPad"
+    if "android" in ua:
+        return "Android"
+    if "mac os" in ua or "macintosh" in ua:
+        return "macOS"
+    if "windows" in ua:
+        return "Windows"
+    if "linux" in ua:
+        return "Linux"
+    return "Unknown device"
 
 
 @router.post("", response_model=CreateJobResponse)
@@ -56,6 +78,10 @@ async def create_job(
     detect_people: Annotated[bool, Form()] = True,
     generate_summary: Annotated[bool, Form()] = True,
     enable_active_speaker_model: Annotated[bool, Form()] = True,
+    enable_subtitles: Annotated[bool, Form()] = True,
+    enable_burned_video: Annotated[bool, Form()] = True,
+    enable_mask_overlay: Annotated[bool, Form()] = False,
+    ui_locale: Annotated[str, Form()] = "en",
 ) -> CreateJobResponse:
     container = _container(request)
     data = await video.read()
@@ -74,16 +100,30 @@ async def create_job(
         detect_people=detect_people,
         generate_summary=generate_summary,
         enable_active_speaker_model=enable_active_speaker_model,
+        enable_subtitles=enable_subtitles,
+        enable_burned_video=enable_burned_video,
+        enable_mask_overlay=enable_mask_overlay,
+        ui_locale="ru" if ui_locale == "ru" else "en",
     )
 
     input_path = container.storage.save_upload(job_id, filename, data)
+    device_label = _device_label(request.headers.get("user-agent"))
     container.repository.create_job(
         job_id=job_id,
         original_filename=filename,
         input_video_path=str(input_path),
         options=options,
+        created_by_device=device_label,
+        locale=options.ui_locale,
     )
     return CreateJobResponse(job=_to_job_view(container, job_id))
+
+
+@router.get("", response_model=JobLibraryResponse)
+def list_jobs(request: Request, limit: int = 100) -> JobLibraryResponse:
+    container = _container(request)
+    items = [_to_job_view(container, job.id) for job in container.repository.list_jobs(limit=limit)]
+    return JobLibraryResponse(items=items)
 
 
 @router.get("/{job_id}", response_model=JobView)
@@ -156,4 +196,3 @@ def download_artifact(job_id: str, artifact_name: str, request: Request) -> File
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact file missing on disk")
     return FileResponse(path=path, filename=match.name, media_type=match.mime_type)
-
