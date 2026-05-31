@@ -159,6 +159,33 @@
   margin-top: -4px;
 }
 
+.video-preview {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+  padding: 8px;
+}
+
+.video-player {
+  width: 100%;
+  border-radius: 10px;
+  max-height: 320px;
+  background: #0e1a27;
+}
+
+.upload-runtime {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  background: #fff;
+  display: grid;
+  gap: 6px;
+}
+
+.progress-shell.thin {
+  height: 6px;
+}
+
 .toggle-grid {
   display: grid;
   gap: 8px;

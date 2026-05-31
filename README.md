@@ -16,11 +16,13 @@ Core stack:
   - stage progress in %
   - live speed
   - ETA
+- Chunked upload over WebSocket with live upload telemetry
 - RU/EN localization switch in UI
 - Feature toggles per job (enable/disable parts of pipeline)
 - Mobile-ready UI for iPhone/Android uploads and downloads
 - Storage page (job library) to open old jobs and re-download artifacts
-- Job author tagged by detected device from `User-Agent`
+- Job author tagged by detected `device + OS + browser` from `User-Agent`
+- In-app video preview player for source and generated outputs
 - Exports:
   - subtitles: `SRT`, `VTT`, `ASS`
   - video with burned subtitles: `MP4`

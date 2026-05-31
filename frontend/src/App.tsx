@@ -4,11 +4,13 @@ import type { Artifact, JobView, PersonProfile, VideoReport } from './types'
 import {
   artifactDownloadUrl,
   createJob,
+  createJobChunked,
   fetchArtifacts,
   fetchJob,
   fetchJobLibrary,
   fetchPeople,
   fetchReport,
+  type UploadProgress,
   requestExportBundle
 } from './api'
 import './App.css'
@@ -162,6 +164,18 @@ function formatSpeed(speed: number | null | undefined, unit: string | null | und
   return `${speed.toFixed(2)} ${unit}`
 }
 
+function formatBytesPerSecond(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value) || value <= 0) return '-'
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
+  let speed = value
+  let unitIndex = 0
+  while (speed >= 1024 && unitIndex < units.length - 1) {
+    speed /= 1024
+    unitIndex += 1
+  }
+  return `${speed.toFixed(2)} ${units[unitIndex]}`
+}
+
 function currentStageLabel(job: JobView | null, locale: Locale, t: Record<string, string>): string {
   if (!job) return t.waiting
   if (job.status === 'failed') return job.error_message || 'Failed'
@@ -202,6 +216,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabId>('subtitles')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null)
 
   const completed = job?.status === 'completed'
   const isRunning = job?.status === 'queued' || job?.status === 'running'
@@ -220,16 +235,39 @@ function App() {
     [artifacts]
   )
   const zipArtifact = useMemo(() => artifacts.find((item) => item.kind === 'export_zip'), [artifacts])
+  const videoArtifact = useMemo(
+    () =>
+      artifacts.find((item) => item.kind === 'video_masked') ||
+      artifacts.find((item) => item.kind === 'video_burned'),
+    [artifacts]
+  )
+  const visibleStages = useMemo(() => {
+    if (!job) return []
+    const currentIndex = STAGE_ORDER.indexOf(job.current_step ?? 'ingest')
+    return STAGE_ORDER.filter((step, index) => {
+      const hasRuntime = Boolean(job.runtime.stages?.[step])
+      return hasRuntime || index <= Math.max(currentIndex, 0)
+    })
+  }, [job])
+  const inputPreviewUrl = useMemo(() => (file ? URL.createObjectURL(file) : null), [file])
+  const videoPlaybackUrl =
+    job && videoArtifact ? artifactDownloadUrl(job.id, videoArtifact.name) : inputPreviewUrl
 
   const hydrateResults = async (jobId: string) => {
-    const [nextArtifacts, nextPeople, nextReport] = await Promise.all([
+    const [nextArtifacts, nextPeople, nextReport] = await Promise.allSettled([
       fetchArtifacts(jobId),
       fetchPeople(jobId),
       fetchReport(jobId)
     ])
-    setArtifacts(nextArtifacts)
-    setPeople(nextPeople)
-    setReport(nextReport)
+    if (nextArtifacts.status === 'fulfilled') {
+      setArtifacts(nextArtifacts.value)
+    }
+    if (nextPeople.status === 'fulfilled') {
+      setPeople(nextPeople.value)
+    }
+    if (nextReport.status === 'fulfilled') {
+      setReport(nextReport.value)
+    }
   }
 
   const refreshLibrary = async () => {
@@ -259,6 +297,15 @@ function App() {
     }
   }, [])
 
+  useEffect(
+    () => () => {
+      if (inputPreviewUrl) {
+        URL.revokeObjectURL(inputPreviewUrl)
+      }
+    },
+    [inputPreviewUrl]
+  )
+
   useEffect(() => {
     if (!job || !isRunning) return
     const timer = window.setInterval(async () => {
@@ -287,23 +334,44 @@ function App() {
     setArtifacts([])
     setPeople([])
     setReport(null)
+    setUploadProgress(null)
     try {
-      const created = await createJob({
-        file,
-        language: language.trim() || undefined,
-        autoDetectLanguage: language.trim().length === 0,
-        qualityPreset,
-        detectPeople: options.detectPeople,
-        generateSummary: options.generateSummary,
-        enableActiveSpeakerModel: options.enableActiveSpeakerModel,
-        enableSubtitles: options.enableSubtitles,
-        enableBurnedVideo: options.enableBurnedVideo,
-        enableMaskOverlay: options.enableMaskOverlay,
-        uiLocale: locale,
-        exportFormats: selectedExportFormats
-      })
+      let created: JobView
+      try {
+        created = await createJobChunked({
+          file,
+          language: language.trim() || undefined,
+          autoDetectLanguage: language.trim().length === 0,
+          qualityPreset,
+          detectPeople: options.detectPeople,
+          generateSummary: options.generateSummary,
+          enableActiveSpeakerModel: options.enableActiveSpeakerModel,
+          enableSubtitles: options.enableSubtitles,
+          enableBurnedVideo: options.enableBurnedVideo,
+          enableMaskOverlay: options.enableMaskOverlay,
+          uiLocale: locale,
+          exportFormats: selectedExportFormats,
+          onProgress: (progress) => setUploadProgress(progress)
+        })
+      } catch {
+        created = await createJob({
+          file,
+          language: language.trim() || undefined,
+          autoDetectLanguage: language.trim().length === 0,
+          qualityPreset,
+          detectPeople: options.detectPeople,
+          generateSummary: options.generateSummary,
+          enableActiveSpeakerModel: options.enableActiveSpeakerModel,
+          enableSubtitles: options.enableSubtitles,
+          enableBurnedVideo: options.enableBurnedVideo,
+          enableMaskOverlay: options.enableMaskOverlay,
+          uiLocale: locale,
+          exportFormats: selectedExportFormats
+        })
+      }
       setJob(created)
       setActiveTab('subtitles')
+      setUploadProgress(null)
       await refreshLibrary()
     } catch (createError) {
       setError((createError as Error).message)
@@ -327,7 +395,15 @@ function App() {
   async function openJobFromLibrary(item: JobView) {
     setJob(item)
     setError(null)
+    setUploadProgress(null)
+    setArtifacts(item.artifacts ?? [])
+    setPeople([])
+    setReport(null)
+    setActiveTab('subtitles')
     try {
+      const latest = await fetchJob(item.id)
+      setJob(latest)
+      setArtifacts(latest.artifacts ?? item.artifacts ?? [])
       await hydrateResults(item.id)
     } catch (openError) {
       setError((openError as Error).message)
@@ -388,6 +464,33 @@ function App() {
               />
             </label>
             <p className="mobile-hint">{t.mobileHint}</p>
+            {inputPreviewUrl && (
+              <div className="video-preview">
+                <video className="video-player" src={inputPreviewUrl} controls playsInline preload="metadata" />
+              </div>
+            )}
+            {uploadProgress && (
+              <div className="upload-runtime">
+                <div className="step-main">
+                  <span>{locale === 'ru' ? 'Загрузка видео' : 'Video upload'}</span>
+                  <span>
+                    {uploadProgress.percent == null
+                      ? '-'
+                      : `${Math.round(uploadProgress.percent * 100)}%`}
+                  </span>
+                </div>
+                <div className="progress-shell thin">
+                  <div
+                    className="progress-value"
+                    style={{ width: `${Math.round((uploadProgress.percent ?? 0) * 100)}%` }}
+                  />
+                </div>
+                <small>
+                  {t.speed}: {formatBytesPerSecond(uploadProgress.speedBytesPerSec)} | {t.eta}:{' '}
+                  {formatSeconds(uploadProgress.etaSeconds)}
+                </small>
+              </div>
+            )}
 
             <label className="field">
               <span>{t.language}</span>
@@ -497,18 +600,31 @@ function App() {
             </div>
           </div>
           <div className="step-list">
-            {STAGE_ORDER.map((step) => {
+            {!job && (
+              <div className="step">
+                <div className="step-main">
+                  <span>{locale === 'ru' ? 'Ожидание задачи' : 'Waiting for job'}</span>
+                  <span>0%</span>
+                </div>
+                <small>{t.waiting}</small>
+              </div>
+            )}
+            {visibleStages.map((step) => {
               const stage = job?.runtime.stages?.[step]
               const label = STEP_LABELS[step]?.[locale] ?? step
               const active = job?.current_step === step && job.status === 'running'
               const done = stage?.completed || job?.status === 'completed'
+              const waitingText = locale === 'ru' ? 'Ожидание этапа' : 'Waiting for stage'
+              const runningText = locale === 'ru' ? 'Этап выполняется' : 'Stage is running'
+              const completedText = locale === 'ru' ? 'Этап завершен' : 'Stage completed'
+              const stageMessage = stage?.message || (done ? completedText : active ? runningText : waitingText)
               return (
                 <div key={step} className={done ? 'step done' : active ? 'step active' : 'step'}>
                   <div className="step-main">
                     <span>{label}</span>
                     <span>{stage ? `${Math.round(stage.progress * 100)}%` : '0%'}</span>
                   </div>
-                  {stage?.message && <small>{stage.message}</small>}
+                  <small>{stageMessage}</small>
                   {(stage?.speed != null || stage?.eta_seconds != null) && (
                     <small>
                       {t.speed}: {formatSpeed(stage.speed, stage.speed_unit)} | {t.eta}:{' '}
@@ -610,6 +726,17 @@ function App() {
 
           {activeTab === 'video' && (
             <div className="tab-content">
+              {videoPlaybackUrl && (
+                <div className="video-preview">
+                  <video
+                    className="video-player"
+                    src={videoPlaybackUrl}
+                    controls
+                    playsInline
+                    preload="metadata"
+                  />
+                </div>
+              )}
               {burnedArtifact ? (
                 <a
                   className="primary ghost"
