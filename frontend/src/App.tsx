@@ -358,6 +358,8 @@ export default function App() {
   const cameraStreamRef = useRef<MediaStream | null>(null)
   const cameraRecorderRef = useRef<MediaRecorder | null>(null)
   const cameraWsRef = useRef<CameraWsContext | null>(null)
+  const finalizeCameraJobRef = useRef<(() => Promise<void>) | null>(null)
+  const cameraFinalizingRef = useRef(false)
   const cameraChunksRef = useRef<Blob[]>([])
   const cameraTickerRef = useRef<number | null>(null)
   const cameraAutoStopRef = useRef<number | null>(null)
@@ -735,6 +737,15 @@ export default function App() {
               'Auto-stop reached (20+ sec). Running final HQ pass.'
             )
           )
+          void (async () => {
+            const finalize = finalizeCameraJobRef.current
+            if (!finalize) return
+            try {
+              await finalize()
+            } catch (err) {
+              setError((err as Error).message)
+            }
+          })()
         }
       }, Math.max(5, autoStopSeconds) * 1000)
     } catch (err) {
@@ -744,9 +755,14 @@ export default function App() {
   }, [autoStopSeconds, closeCamera, ensureCameraStream, locale, resetCameraTimers, startCameraUploadSession])
 
   const finalizeCameraJob = useCallback(async () => {
+    if (cameraFinalizingRef.current) {
+      return
+    }
+    cameraFinalizingRef.current = true
     const recorder = cameraRecorderRef.current
     const wsContext = cameraWsRef.current
     if (!recorder || !wsContext) {
+      cameraFinalizingRef.current = false
       throw new Error('Camera recording session is not started')
     }
 
@@ -807,6 +823,7 @@ export default function App() {
       wsContext.ws.close()
       cameraWsRef.current = null
       setCameraSessionActive(false)
+      cameraFinalizingRef.current = false
     }
   }, [
     autoDetectLanguage,
@@ -837,6 +854,10 @@ export default function App() {
     } catch (err) {
       setError((err as Error).message)
     }
+  }, [finalizeCameraJob])
+
+  useEffect(() => {
+    finalizeCameraJobRef.current = finalizeCameraJob
   }, [finalizeCameraJob])
 
   const handleFileSubmit = useCallback(async () => {
