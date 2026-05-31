@@ -12,7 +12,10 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
 
     video_path = tmp_path / "demo.mp4"
     video_path.write_bytes(b"fake video")
-    options = JobOptions(export_formats=["srt", "vtt", "ass", "mp4_burned"])
+    options = JobOptions(
+        export_formats=["srt", "vtt", "ass", "mp4_burned"],
+        subtitle_embed_mode="burned",
+    )
     container.repository.create_job(
         job_id="job-e2e",
         original_filename="demo.mp4",

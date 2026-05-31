@@ -50,9 +50,10 @@ def _transcript_to_prompt_lines(segments: list[TranscriptSegment], limit: int = 
 def _people_to_prompt_lines(people: list[PersonProfile]) -> str:
     rows: list[str] = []
     for person in people:
+        label = person.display_name or person.person_id
         rows.append(
             (
-                f"{person.person_id}: screen_time={person.track_stats.screen_time_seconds:.2f}s, "
+                f"{person.person_id} ({label}): screen_time={person.track_stats.screen_time_seconds:.2f}s, "
                 f"speaking={person.track_stats.speaking_seconds:.2f}s, "
                 f"avg_conf={person.track_stats.avg_confidence:.3f}"
             )

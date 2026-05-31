@@ -33,6 +33,14 @@ def run_command(cmd: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None 
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
+def run_command_checked(
+    cmd: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None
+) -> bool:
+    print(f"[run] {cwd}: {format_cmd(cmd)}")
+    completed = subprocess.run(cmd, cwd=cwd, env=env, check=False)
+    return completed.returncode == 0
+
+
 def require_binary(binary_name: str) -> None:
     if shutil.which(binary_name) is None:
         raise SystemExit(f"Required binary was not found in PATH: {binary_name}")
@@ -82,6 +90,51 @@ def run_checks(*, include_frontend_lint: bool = True) -> None:
 
 def run_build() -> None:
     run_command([npm_executable(), "run", "build"], cwd=FRONTEND_DIR)
+
+
+def backend_dependencies_healthy() -> bool:
+    if not VENV_PYTHON.exists():
+        return False
+    if not run_command_checked([str(VENV_PYTHON), "-m", "pip", "check"], cwd=BACKEND_DIR):
+        return False
+    return run_command_checked(
+        [
+            str(VENV_PYTHON),
+            "-c",
+            (
+                "import fastapi,uvicorn,pydantic,numpy,cv2,requests;"
+                "import openvino; import faster_whisper"
+            ),
+        ],
+        cwd=BACKEND_DIR,
+    )
+
+
+def frontend_dependencies_healthy() -> bool:
+    if not (FRONTEND_DIR / "node_modules").exists():
+        return False
+    return run_command_checked([npm_executable(), "ls", "--depth=0"], cwd=FRONTEND_DIR)
+
+
+def ensure_missing_dependencies(*, clean: bool) -> None:
+    require_binary(npm_executable())
+    require_binary("ffmpeg")
+    if clean:
+        print("[info] --clean selected. Running full reinstall.")
+        setup_all()
+        return
+
+    if not backend_dependencies_healthy():
+        print("[info] Backend dependencies are missing or invalid. Installing...")
+        setup_backend()
+    else:
+        print("[info] Backend dependencies look healthy.")
+
+    if not frontend_dependencies_healthy():
+        print("[info] Frontend dependencies are missing or invalid. Installing...")
+        setup_frontend()
+    else:
+        print("[info] Frontend dependencies look healthy.")
 
 
 @dataclass
@@ -177,9 +230,81 @@ def run_stack(args: argparse.Namespace) -> None:
         stop_processes(processes)
 
 
+def run_stack_prod(args: argparse.Namespace) -> None:
+    env = runtime_env()
+    env["NEWTONSPECT_FRONTEND_DIST_DIR"] = str(FRONTEND_DIR / "dist")
+    processes: list[ManagedProcess] = []
+    try:
+        api_cmd = [
+            str(VENV_PYTHON),
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            args.api_host,
+            "--port",
+            str(args.api_port),
+        ]
+        worker_cmd = [str(VENV_PYTHON), "worker.py"]
+
+        print("[info] Starting production API, worker, and compiled frontend host...")
+        processes.append(
+            ManagedProcess(
+                "api",
+                subprocess.Popen(api_cmd, cwd=BACKEND_DIR, env=env),
+            )
+        )
+        processes.append(
+            ManagedProcess(
+                "worker",
+                subprocess.Popen(worker_cmd, cwd=BACKEND_DIR, env=env),
+            )
+        )
+
+        print(
+            f"[ready] AstraOrpheus UI+API: http://{args.api_host}:{args.api_port}"
+        )
+        print("[info] Press Ctrl+C to stop all services.")
+
+        while True:
+            for item in processes:
+                code = item.process.poll()
+                if code is not None:
+                    raise RuntimeError(f"Process '{item.name}' exited with code {code}")
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n[info] Stopping services...")
+    finally:
+        stop_processes(processes)
+
+
+def run_force(args: argparse.Namespace) -> None:
+    print("[force] 1/4 pre-check")
+    precheck_failed = False
+    if VENV_PYTHON.exists() and (FRONTEND_DIR / "node_modules").exists():
+        try:
+            run_checks()
+        except subprocess.CalledProcessError:
+            precheck_failed = True
+            print("[warn] Pre-check failed. Will install missing dependencies and re-check.")
+    else:
+        print("[info] Pre-check skipped strict run because dependencies are not fully present yet.")
+
+    print("[force] 2/4 install missing dependencies")
+    ensure_missing_dependencies(clean=args.clean)
+
+    print("[force] 3/4 strict checks + build")
+    run_checks()
+    run_build()
+
+    print("[force] 4/4 production host")
+    _ = precheck_failed
+    run_stack_prod(args)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="NewtonSpect unified build/run script.",
+        description="AstraOrpheus unified build/run script.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -216,6 +341,14 @@ def main() -> int:
     dev_parser.add_argument("--api-port", type=int, default=8000)
     dev_parser.add_argument("--frontend-host", default="127.0.0.1")
     dev_parser.add_argument("--frontend-port", type=int, default=5173)
+
+    force_parser = subparsers.add_parser(
+        "force",
+        help="Check -> install missing deps -> build -> run production stack with compiled frontend.",
+    )
+    force_parser.add_argument("--clean", action="store_true", help="Force full reinstall before build.")
+    force_parser.add_argument("--api-host", default="127.0.0.1")
+    force_parser.add_argument("--api-port", type=int, default=8000)
 
     args = parser.parse_args()
     if not args.command:
@@ -254,9 +387,12 @@ def main() -> int:
         run_stack(args)
         return 0
 
+    if args.command == "force":
+        run_force(args)
+        return 0
+
     raise SystemExit(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

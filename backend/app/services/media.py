@@ -7,6 +7,15 @@ from typing import Callable
 
 
 class MediaService:
+    CURATED_FORMATS: tuple[tuple[str, str, bool, str | None, str | None], ...] = (
+        ("mp4", "mp4", True, "mov_text", "Best compatibility on iPhone/Android"),
+        ("mkv", "matroska", True, "srt", "Best subtitle flexibility"),
+        ("mov", "mov", True, "mov_text", "Apple ecosystem compatibility"),
+        ("webm", "webm", False, None, "Use sidecar subtitles"),
+        ("avi", "avi", False, None, "Use sidecar subtitles"),
+        ("mpegts", "mpegts", False, None, "Use sidecar subtitles"),
+    )
+
     def run_ffmpeg(self, args: list[str], cwd: Path | None = None) -> None:
         cmd = ["ffmpeg", "-y", *args]
         completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -53,6 +62,36 @@ class MediaService:
         )
         return output_wav
 
+    def list_ffmpeg_muxers(self) -> list[str]:
+        cmd = ["ffmpeg", "-hide_banner", "-muxers"]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            return []
+        muxers: list[str] = []
+        for line in completed.stdout.splitlines():
+            line = line.rstrip()
+            if not line or line.startswith(" " * 2) is False and line.startswith("Formats:"):
+                continue
+            if " E " not in line and not line.startswith(" E"):
+                continue
+            # Example: "  E  mp4             MP4 (MPEG-4 Part 14)"
+            tokens = line.split()
+            if len(tokens) >= 2:
+                muxers.append(tokens[1].strip().lower())
+        return sorted(set(muxers))
+
+    def curated_video_formats(self) -> list[dict[str, str | bool | None]]:
+        return [
+            {
+                "format": item[0],
+                "ffmpeg_muxer": item[1],
+                "can_embed_subtitles": item[2],
+                "preferred_subtitle_codec": item[3],
+                "notes": item[4],
+            }
+            for item in self.CURATED_FORMATS
+        ]
+
     def burn_ass_subtitles(self, video_path: Path, ass_path: Path, output_video: Path) -> Path:
         output_video.parent.mkdir(parents=True, exist_ok=True)
         self.run_ffmpeg(
@@ -74,6 +113,47 @@ class MediaService:
                 str(output_video),
             ],
             cwd=ass_path.parent,
+        )
+        return output_video
+
+    def embed_soft_subtitles(
+        self,
+        input_video: Path,
+        subtitle_path: Path,
+        output_video: Path,
+        *,
+        container_format: str,
+        subtitle_codec: str,
+    ) -> Path:
+        output_video.parent.mkdir(parents=True, exist_ok=True)
+        ext = output_video.suffix.lower()
+        if ext == ".mp4" or container_format in {"mp4", "mov"}:
+            subtitle_codec = "mov_text"
+        elif ext == ".mkv" and subtitle_codec not in {"srt", "ass", "ssa", "webvtt"}:
+            subtitle_codec = "srt"
+
+        self.run_ffmpeg(
+            [
+                "-i",
+                str(input_video),
+                "-i",
+                str(subtitle_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-map",
+                "1:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-c:s",
+                subtitle_codec,
+                "-metadata:s:s:0",
+                "language=rus",
+                str(output_video),
+            ]
         )
         return output_video
 

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import cv2
 import numpy as np
+
 try:
     from openvino import Core
 except ImportError:  # pragma: no cover
@@ -19,6 +20,7 @@ from .types import FaceTrackSample, VisionAnalysisResult
 
 @dataclass
 class _CompiledModelInfo:
+    name: str
     compiled: Any
     input_name: str
     output_name: str
@@ -29,8 +31,10 @@ class _CompiledModelInfo:
 @dataclass
 class _PersonAccumulator:
     person_id: str
-    embedding_centroid: np.ndarray
-    embedding_count: int = 1
+    person_embedding_centroid: np.ndarray
+    person_embedding_count: int = 1
+    face_embedding_centroid: np.ndarray | None = None
+    face_embedding_count: int = 0
     first_seen: float = 0.0
     last_seen: float = 0.0
     confidence_sum: float = 0.0
@@ -39,17 +43,37 @@ class _PersonAccumulator:
     best_portrait: np.ndarray | None = None
     best_area: int = 0
     previous_mouth_ratio: float = 0.0
+    face_hits: int = 0
 
 
 class OpenVINOPeopleAnalyzer:
-    def __init__(self, models_dir: Path, preferred_devices: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        models_dir: Path,
+        preferred_devices: tuple[str, ...],
+        model_search_paths: tuple[Path, ...] | None = None,
+    ) -> None:
         self.models_dir = models_dir
+        self.model_search_paths = tuple(
+            path.resolve() for path in (model_search_paths or (models_dir,))
+        )
         self.preferred_devices = preferred_devices
         self.core = Core()
         self.device = self._resolve_device()
-        self.face_detector = self._load_model("face-detection-retail-0005")
-        self.face_reid = self._load_model("face-reidentification-retail-0095")
-        self.landmarks = self._load_model("landmarks-regression-retail-0009")
+
+        self.person_detector = self._load_model("person-detection-retail-0013")
+        self.person_reid = self._load_model("person-reidentification-retail-0277")
+        self.face_detector = self._load_model("face-detection-retail-0004") or self._load_model(
+            "face-detection-retail-0005"
+        )
+        self.face_reid = self._load_model("face-recognition-resnet100-arcface-onnx") or self._load_model(
+            "face-reidentification-retail-0095"
+        )
+        self.landmarks = (
+            self._load_model("facial-landmarks-98-detection-0001")
+            or self._load_model("facial-landmarks-35-adas-0002")
+            or self._load_model("landmarks-regression-retail-0009")
+        )
         self.haar_detector = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
@@ -68,7 +92,7 @@ class OpenVINOPeopleAnalyzer:
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps = fps if fps and fps > 0 else 25.0
-        sample_every = max(int(fps // 2), 1)  # ~2 FPS for cost control
+        sample_every = max(int(fps // 3), 1)  # ~3 FPS for better tracking quality
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         started = time.perf_counter()
 
@@ -83,27 +107,40 @@ class OpenVINOPeopleAnalyzer:
             if frame_idx % sample_every != 0:
                 frame_idx += 1
                 continue
-            time_sec = frame_idx / fps
 
-            faces = self._detect_faces(frame)
-            for x1, y1, x2, y2, conf in faces:
-                face_crop = frame[y1:y2, x1:x2]
-                if face_crop.size == 0:
+            time_sec = frame_idx / fps
+            person_boxes = self._detect_persons(frame)
+            for x1, y1, x2, y2, conf in person_boxes:
+                crop = frame[y1:y2, x1:x2]
+                if crop.size == 0:
                     continue
-                emb = self._compute_embedding(face_crop)
-                person_id = self._match_or_create_person(accumulators, emb, time_sec)
+
+                person_embedding = self._compute_person_embedding(crop)
+                face_crop, face_conf, mouth_activity = self._extract_face_features(crop)
+                face_embedding = (
+                    self._compute_face_embedding(face_crop) if face_crop is not None else None
+                )
+
+                person_id = self._match_or_create_person(
+                    accumulators,
+                    person_embedding=person_embedding,
+                    face_embedding=face_embedding,
+                    time_sec=time_sec,
+                )
                 acc = accumulators[person_id]
                 acc.last_seen = time_sec
-                acc.confidence_sum += conf
+                combined_conf = 0.7 * conf + 0.3 * face_conf
+                acc.confidence_sum += combined_conf
                 acc.detections += 1
-                area = max((x2 - x1) * (y2 - y1), 0)
-                if area > acc.best_area:
-                    acc.best_area = area
-                    acc.best_portrait = face_crop.copy()
+                if face_crop is not None:
+                    acc.face_hits += 1
 
-                mouth_ratio = self._estimate_mouth_ratio(face_crop)
-                mouth_activity = abs(mouth_ratio - acc.previous_mouth_ratio)
-                acc.previous_mouth_ratio = mouth_ratio
+                area = max((x2 - x1) * (y2 - y1), 0)
+                portrait_candidate = face_crop if face_crop is not None else crop
+                if area > acc.best_area and portrait_candidate is not None and portrait_candidate.size > 0:
+                    acc.best_area = area
+                    acc.best_portrait = portrait_candidate.copy()
+
                 if mouth_activity > 0.015:
                     acc.speaking_seconds += 1.0 / max(fps / sample_every, 1.0)
 
@@ -111,26 +148,37 @@ class OpenVINOPeopleAnalyzer:
                     FaceTrackSample(
                         person_id=person_id,
                         time_sec=time_sec,
-                        confidence=conf,
+                        confidence=combined_conf,
                         mouth_activity=mouth_activity,
                     )
                 )
+
             if progress_callback is not None:
                 elapsed = max(time.perf_counter() - started, 1e-6)
                 progress_callback(frame_idx + 1, total_frames, elapsed)
             frame_idx += 1
+
         cap.release()
 
         people: list[PersonProfile] = []
         for acc in accumulators.values():
+            avg_conf = acc.confidence_sum / acc.detections if acc.detections else 0.0
+            screen_time = max(acc.last_seen - acc.first_seen, 0.0)
+            # Anti-false-positive gating:
+            # keep only stable tracks or tracks backed by visible face evidence.
+            if acc.detections < 2 and acc.face_hits == 0:
+                continue
+            if screen_time < 0.35 and acc.face_hits == 0:
+                continue
+            if avg_conf < 0.42:
+                continue
+
             portrait_path: str | None = None
             if acc.best_portrait is not None:
                 out_path = people_output_dir / f"{acc.person_id}.jpg"
                 cv2.imwrite(str(out_path), acc.best_portrait)
                 portrait_path = str(out_path)
 
-            screen_time = max(acc.last_seen - acc.first_seen, 0.0)
-            avg_conf = acc.confidence_sum / acc.detections if acc.detections else 0.0
             people.append(
                 PersonProfile(
                     person_id=acc.person_id,
@@ -145,6 +193,7 @@ class OpenVINOPeopleAnalyzer:
                     key_comments=[],
                 )
             )
+
         people.sort(key=lambda p: p.track_stats.screen_time_seconds, reverse=True)
         return VisionAnalysisResult(people=people, samples=samples, device_used=self.device)
 
@@ -156,8 +205,11 @@ class OpenVINOPeopleAnalyzer:
         return "CPU"
 
     def _find_model_xml(self, model_name: str) -> Path | None:
-        matches = list(self.models_dir.rglob(f"{model_name}.xml"))
-        return matches[0] if matches else None
+        for root in self.model_search_paths:
+            matches = list(root.rglob(f"{model_name}.xml"))
+            if matches:
+                return matches[0]
+        return None
 
     def _load_model(self, model_name: str) -> _CompiledModelInfo | None:
         xml_path = self._find_model_xml(model_name)
@@ -169,12 +221,62 @@ class OpenVINOPeopleAnalyzer:
         output_port = compiled.output(0)
         shape = list(input_port.shape)
         return _CompiledModelInfo(
+            name=model_name,
             compiled=compiled,
             input_name=input_port.get_any_name(),
             output_name=output_port.get_any_name(),
             input_h=int(shape[2]),
             input_w=int(shape[3]),
         )
+
+    def _detect_persons(self, frame: np.ndarray) -> list[tuple[int, int, int, int, float]]:
+        if self.person_detector is None:
+            # Fallback: use full frame as one region if no detector available.
+            h, w = frame.shape[:2]
+            return [(0, 0, w - 1, h - 1, 0.2)]
+
+        blob = cv2.resize(frame, (self.person_detector.input_w, self.person_detector.input_h))
+        blob = np.transpose(blob, (2, 0, 1))[None, ...].astype(np.float32)
+        results = self.person_detector.compiled({self.person_detector.input_name: blob})[
+            self.person_detector.output_name
+        ]
+
+        h, w = frame.shape[:2]
+        boxes: list[tuple[int, int, int, int, float]] = []
+        for det in np.reshape(results, (-1, 7)):
+            conf = float(det[2])
+            if conf < 0.45:
+                continue
+            x1 = max(int(det[3] * w), 0)
+            y1 = max(int(det[4] * h), 0)
+            x2 = min(int(det[5] * w), w - 1)
+            y2 = min(int(det[6] * h), h - 1)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            area_ratio = ((x2 - x1) * (y2 - y1)) / max(float(w * h), 1.0)
+            if area_ratio < 0.01 or area_ratio > 0.95:
+                continue
+            aspect = (x2 - x1) / max(float(y2 - y1), 1.0)
+            if aspect < 0.15 or aspect > 1.25:
+                continue
+            boxes.append((x1, y1, x2, y2, conf))
+        return boxes
+
+    def _extract_face_features(
+        self, person_crop: np.ndarray
+    ) -> tuple[np.ndarray | None, float, float]:
+        faces = self._detect_faces(person_crop)
+        if not faces:
+            return None, 0.0, 0.0
+        x1, y1, x2, y2, conf = max(
+            faces,
+            key=lambda item: (item[2] - item[0]) * (item[3] - item[1]),
+        )
+        face_crop = person_crop[y1:y2, x1:x2]
+        if face_crop.size == 0:
+            return None, 0.0, 0.0
+        mouth_ratio = self._estimate_mouth_ratio(face_crop)
+        return face_crop, conf, mouth_ratio
 
     def _detect_faces(self, frame: np.ndarray) -> list[tuple[int, int, int, int, float]]:
         if self.face_detector is not None:
@@ -206,14 +308,23 @@ class OpenVINOPeopleAnalyzer:
     def _detect_faces_haar(self, frame: np.ndarray) -> list[tuple[int, int, int, int, float]]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         detected = self.haar_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-        boxes: list[tuple[int, int, int, int, float]] = []
-        for (x, y, w, h) in detected:
-            boxes.append((int(x), int(y), int(x + w), int(y + h), 0.5))
-        return boxes
+        return [(int(x), int(y), int(x + w), int(y + h), 0.5) for (x, y, w, h) in detected]
 
-    def _compute_embedding(self, face_crop: np.ndarray) -> np.ndarray:
+    def _compute_person_embedding(self, crop: np.ndarray) -> np.ndarray:
+        if self.person_reid is not None:
+            blob = cv2.resize(crop, (self.person_reid.input_w, self.person_reid.input_h))
+            blob = np.transpose(blob, (2, 0, 1))[None, ...].astype(np.float32)
+            vec = self.person_reid.compiled({self.person_reid.input_name: blob})[
+                self.person_reid.output_name
+            ]
+            emb = np.asarray(vec, dtype=np.float32).reshape(-1)
+            norm = np.linalg.norm(emb) + 1e-8
+            return emb / norm
+        return self._hist_embedding(crop)
+
+    def _compute_face_embedding(self, crop: np.ndarray) -> np.ndarray:
         if self.face_reid is not None:
-            blob = cv2.resize(face_crop, (self.face_reid.input_w, self.face_reid.input_h))
+            blob = cv2.resize(crop, (self.face_reid.input_w, self.face_reid.input_h))
             blob = np.transpose(blob, (2, 0, 1))[None, ...].astype(np.float32)
             vec = self.face_reid.compiled({self.face_reid.input_name: blob})[
                 self.face_reid.output_name
@@ -221,43 +332,72 @@ class OpenVINOPeopleAnalyzer:
             emb = np.asarray(vec, dtype=np.float32).reshape(-1)
             norm = np.linalg.norm(emb) + 1e-8
             return emb / norm
+        return self._hist_embedding(crop)
 
-        # Fallback embedding: HSV histogram descriptor.
-        hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
+    @staticmethod
+    def _hist_embedding(crop: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
         hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
-        norm = np.linalg.norm(hist) + 1e-8
-        return hist / norm
+        return hist / (np.linalg.norm(hist) + 1e-8)
 
     def _match_or_create_person(
-        self, accumulators: dict[str, _PersonAccumulator], embedding: np.ndarray, time_sec: float
+        self,
+        accumulators: dict[str, _PersonAccumulator],
+        *,
+        person_embedding: np.ndarray,
+        face_embedding: np.ndarray | None,
+        time_sec: float,
     ) -> str:
         best_person: str | None = None
-        best_sim = -1.0
+        best_score = -1.0
         for person_id, acc in accumulators.items():
-            sim = float(np.dot(acc.embedding_centroid, embedding))
-            if sim > best_sim:
-                best_sim = sim
+            person_sim = float(np.dot(acc.person_embedding_centroid, person_embedding))
+            if face_embedding is not None and acc.face_embedding_centroid is not None:
+                face_sim = float(np.dot(acc.face_embedding_centroid, face_embedding))
+                score = 0.65 * person_sim + 0.35 * face_sim
+            else:
+                score = person_sim
+            if score > best_score:
+                best_score = score
                 best_person = person_id
 
-        threshold = 0.62 if self.face_reid is not None else 0.86
-        if best_person is None or best_sim < threshold:
+        threshold = 0.58 if self.person_reid is not None else 0.82
+        if best_person is None or best_score < threshold:
             person_id = f"P{self._next_person_index:03d}"
             self._next_person_index += 1
             accumulators[person_id] = _PersonAccumulator(
                 person_id=person_id,
-                embedding_centroid=embedding.copy(),
+                person_embedding_centroid=person_embedding.copy(),
                 first_seen=time_sec,
                 last_seen=time_sec,
+                face_embedding_centroid=face_embedding.copy() if face_embedding is not None else None,
+                face_embedding_count=1 if face_embedding is not None else 0,
             )
             return person_id
 
         acc = accumulators[best_person]
-        acc.embedding_count += 1
-        alpha = 1.0 / acc.embedding_count
-        acc.embedding_centroid = (1.0 - alpha) * acc.embedding_centroid + alpha * embedding
-        norm = np.linalg.norm(acc.embedding_centroid) + 1e-8
-        acc.embedding_centroid = acc.embedding_centroid / norm
+        acc.person_embedding_count += 1
+        alpha = 1.0 / acc.person_embedding_count
+        acc.person_embedding_centroid = (
+            (1.0 - alpha) * acc.person_embedding_centroid + alpha * person_embedding
+        )
+        acc.person_embedding_centroid = acc.person_embedding_centroid / (
+            np.linalg.norm(acc.person_embedding_centroid) + 1e-8
+        )
+        if face_embedding is not None:
+            if acc.face_embedding_centroid is None:
+                acc.face_embedding_centroid = face_embedding.copy()
+                acc.face_embedding_count = 1
+            else:
+                acc.face_embedding_count += 1
+                beta = 1.0 / acc.face_embedding_count
+                acc.face_embedding_centroid = (
+                    (1.0 - beta) * acc.face_embedding_centroid + beta * face_embedding
+                )
+                acc.face_embedding_centroid = acc.face_embedding_centroid / (
+                    np.linalg.norm(acc.face_embedding_centroid) + 1e-8
+                )
         return best_person
 
     def _estimate_mouth_ratio(self, face_crop: np.ndarray) -> float:
@@ -273,7 +413,6 @@ class OpenVINOPeopleAnalyzer:
                 mouth_right = np.array([pts[8], pts[9]], dtype=np.float32)
                 dist = float(np.linalg.norm(mouth_right - mouth_left))
                 return max(dist, 0.0)
-        # Fallback: use local motion proxy based on lower-face texture energy.
         gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
         h = gray.shape[0]
         lower = gray[int(h * 0.55) :, :]

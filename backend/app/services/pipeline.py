@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -49,6 +50,7 @@ class PipelineRunner:
         self.people_analyzer = OpenVINOPeopleAnalyzer(
             models_dir=settings.openvino_models_dir,
             preferred_devices=settings.preferred_openvino_devices,
+            model_search_paths=settings.openvino_models_search_paths,
         )
         self.speaker_attributor = ActiveSpeakerAttributor(settings.openvino_models_dir)
         self.report_generator = ReportGenerator(
@@ -57,6 +59,7 @@ class PipelineRunner:
         self.mask_renderer = OpenVINOMaskOverlayRenderer(
             settings.openvino_models_dir,
             settings.preferred_openvino_devices,
+            model_search_paths=settings.openvino_models_search_paths,
         )
 
     def process(self, job: JobRecord) -> None:
@@ -80,7 +83,11 @@ class PipelineRunner:
         srt_path = subtitles_dir / "captions.srt"
         vtt_path = subtitles_dir / "captions.vtt"
         ass_path = subtitles_dir / "captions.ass"
-        burned_video_path = exports_dir / "video_burned.mp4"
+        output_format = (options.output_video_format or "mp4").lower().strip(".")
+        if not output_format:
+            output_format = "mp4"
+        burned_video_path = exports_dir / f"video_burned.{output_format}"
+        embedded_video_path = exports_dir / f"video_subtitled.{output_format}"
 
         # Stage: audio extract
         audio_start = time.perf_counter()
@@ -234,6 +241,13 @@ class PipelineRunner:
             attribution = type("Attr", (), {"method": "disabled"})()
             self._stage_update(job.id, "speaker_attribution", 1.0, "Speaker attribution disabled")
 
+        extracted_names = self._extract_names_by_person(segments)
+        for person in vision_result.people:
+            resolved = extracted_names.get(person.person_id)
+            if resolved is not None:
+                person.display_name = resolved[0]
+                person.display_name_confidence = resolved[1]
+
         # Stage: report
         self._stage_update(job.id, "report", 0.03, "Generating AI report")
         report = (
@@ -284,42 +298,99 @@ class PipelineRunner:
                     )
                 )
 
-        # Stage: burned video
-        if options.enable_burned_video and "mp4_burned" in options.export_formats and options.enable_subtitles:
-            video_duration = self.media.probe_duration_seconds(input_video)
-            self._stage_update(job.id, "burned_video", 0.01, "Rendering MP4 with subtitles")
+        # Stage: burned/embedded export
+        should_render_burned = (
+            options.enable_burned_video
+            and options.enable_subtitles
+            and (
+                "mp4_burned" in options.export_formats
+                or options.subtitle_embed_mode == "burned"
+            )
+        )
+        format_map = {entry["format"]: entry for entry in self.media.curated_video_formats()}
+        selected_format = (options.output_video_format or "mp4").lower()
+        format_cap = format_map.get(selected_format)
+        can_embed_subtitles = bool(format_cap and format_cap["can_embed_subtitles"])
+        subtitle_codec = (
+            str(format_cap["preferred_subtitle_codec"]) if format_cap and format_cap["preferred_subtitle_codec"] else "mov_text"
+        )
+        should_embed = (
+            options.enable_subtitles
+            and options.enable_burned_video
+            and options.subtitle_embed_mode in {"auto", "embedded"}
+            and can_embed_subtitles
+        )
 
-            def _burn_progress(processed: float, total: float, eta: float) -> None:
-                progress = processed / total if total > 0 else 0.0
-                speed = processed / max(time.perf_counter() - asr_started, 1e-6)
+        if should_render_burned or should_embed:
+            video_duration = self.media.probe_duration_seconds(input_video)
+            self._stage_update(job.id, "burned_video", 0.01, "Rendering exported video")
+
+            if should_render_burned:
+                def _burn_progress(processed: float, total: float, eta: float) -> None:
+                    progress = processed / total if total > 0 else 0.0
+                    speed = processed / max(time.perf_counter() - asr_started, 1e-6)
+                    self._stage_update(
+                        job.id,
+                        "burned_video",
+                        progress * 0.8,
+                        f"Burning subtitles {processed:.1f}/{total:.1f}s",
+                        speed=speed,
+                        speed_unit="video sec/s",
+                        eta_seconds=eta,
+                    )
+
+                self.media.burn_ass_subtitles_with_progress(
+                    input_video,
+                    ass_path=ass_path,
+                    output_video=burned_video_path,
+                    duration_seconds=video_duration,
+                    progress_callback=_burn_progress,
+                )
+                artifacts.append(
+                    make_artifact(
+                        name=burned_video_path.name,
+                        kind="video_burned",
+                        path=burned_video_path,
+                        mime_type=f"video/{selected_format if selected_format != 'mpegts' else 'mp2t'}",
+                    )
+                )
+
+            if should_embed:
+                subtitle_source = srt_path if subtitle_codec in {"mov_text", "srt"} else ass_path
                 self._stage_update(
                     job.id,
                     "burned_video",
-                    progress,
-                    f"Burning subtitles {processed:.1f}/{total:.1f}s",
-                    speed=speed,
-                    speed_unit="video sec/s",
-                    eta_seconds=eta,
+                    0.85 if should_render_burned else 0.35,
+                    "Embedding soft subtitles",
+                    eta_seconds=5.0,
+                )
+                self.media.embed_soft_subtitles(
+                    input_video=input_video,
+                    subtitle_path=subtitle_source,
+                    output_video=embedded_video_path,
+                    container_format=selected_format,
+                    subtitle_codec=subtitle_codec,
+                )
+                artifacts.append(
+                    make_artifact(
+                        name=embedded_video_path.name,
+                        kind="video_subtitled",
+                        path=embedded_video_path,
+                        mime_type=f"video/{selected_format if selected_format != 'mpegts' else 'mp2t'}",
+                    )
                 )
 
-            self.media.burn_ass_subtitles_with_progress(
-                input_video,
-                ass_path=ass_path,
-                output_video=burned_video_path,
-                duration_seconds=video_duration,
-                progress_callback=_burn_progress,
-            )
-            artifacts.append(
-                make_artifact(
-                    name=burned_video_path.name,
-                    kind="video_burned",
-                    path=burned_video_path,
-                    mime_type="video/mp4",
+            if options.subtitle_embed_mode == "embedded" and not can_embed_subtitles:
+                self.repository.add_event(
+                    job.id,
+                    "burned_video",
+                    f"Embedded subtitles are not supported for format '{selected_format}'. Exported sidecar subtitles instead.",
+                    0.95,
+                    level="warning",
                 )
-            )
-            self._stage_update(job.id, "burned_video", 1.0, "Burned MP4 ready")
+            self._stage_update(job.id, "burned_video", 1.0, "Video export ready")
         else:
-            self._stage_update(job.id, "burned_video", 1.0, "Burned video disabled")
+            self._stage_update(job.id, "burned_video", 1.0, "Video export disabled")
 
         # Stage: mask overlay
         if options.enable_mask_overlay:
@@ -342,6 +413,10 @@ class PipelineRunner:
             mask_result = self.mask_renderer.render(
                 input_video,
                 output_dir=mask_dir,
+                person_display_names={
+                    person.person_id: person.display_name or person.person_id
+                    for person in vision_result.people
+                },
                 progress_callback=_mask_progress,
             )
             artifacts.extend(
@@ -378,6 +453,53 @@ class PipelineRunner:
             ),
             1.0,
         )
+
+    def _extract_names_by_person(
+        self, segments: list[TranscriptSegment]
+    ) -> dict[str, tuple[str, float]]:
+        # RU-first + basic EN patterns for self-introduction.
+        patterns = [
+            re.compile(r"\bменя зовут\s+([А-ЯЁA-Z][а-яёa-z-]{1,30})", flags=re.IGNORECASE),
+            re.compile(r"\bзовите меня\s+([А-ЯЁA-Z][а-яёa-z-]{1,30})", flags=re.IGNORECASE),
+            re.compile(r"\bmy name is\s+([A-Z][a-z-]{1,30})", flags=re.IGNORECASE),
+            re.compile(r"\bcall me\s+([A-Z][a-z-]{1,30})", flags=re.IGNORECASE),
+        ]
+        by_person: dict[str, dict[str, float]] = {}
+        for segment in segments:
+            if not segment.speaker_ref:
+                continue
+            for pattern in patterns:
+                match = pattern.search(segment.text)
+                if not match:
+                    continue
+                normalized = self._normalize_name_token(match.group(1))
+                if not normalized:
+                    continue
+                by_person.setdefault(segment.speaker_ref, {})
+                by_person[segment.speaker_ref][normalized] = by_person[segment.speaker_ref].get(
+                    normalized, 0.0
+                ) + max(segment.confidence, 0.2)
+
+        resolved: dict[str, tuple[str, float]] = {}
+        for person_id, candidates in by_person.items():
+            if not candidates:
+                continue
+            sorted_candidates = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+            best_name, best_score = sorted_candidates[0]
+            total = sum(candidates.values())
+            confidence = best_score / max(total, 1e-6)
+            # Require stable enough evidence to avoid accidental renaming.
+            if confidence < 0.58 and len(sorted_candidates) > 1:
+                continue
+            resolved[person_id] = (best_name, min(max(confidence, 0.0), 1.0))
+        return resolved
+
+    @staticmethod
+    def _normalize_name_token(token: str) -> str:
+        cleaned = token.strip().strip(".,!?;:\"'()[]{}")
+        if not cleaned:
+            return ""
+        return cleaned[0].upper() + cleaned[1:].lower()
 
     def _stage_update(
         self,

@@ -43,15 +43,20 @@ def create_zip_bundle(
 
 def filter_files_for_formats(formats: list[ExportFormat], all_files: list[Path]) -> list[Path]:
     selected: list[Path] = []
-    ext_map = {
+    ext_map: dict[str, str] = {
         "srt": ".srt",
         "vtt": ".vtt",
         "ass": ".ass",
         "mp4_burned": ".mp4",
+        "mp4": ".mp4",
+        "mkv": ".mkv",
+        "mov": ".mov",
+        "webm": ".webm",
+        "avi": ".avi",
+        "mpegts": ".ts",
     }
     allowed = {ext_map[item] for item in formats if item in ext_map}
     for path in all_files:
         if path.suffix.lower() in allowed:
             selected.append(path)
     return selected
-

@@ -29,4 +29,3 @@ def build_container() -> Container:
     repository = JobRepository(settings.db_path)
     storage = StorageService(settings.storage_root)
     return Container(settings=settings, repository=repository, storage=storage)
-

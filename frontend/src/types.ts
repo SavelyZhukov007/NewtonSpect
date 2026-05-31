@@ -1,6 +1,6 @@
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed'
 
-export type ExportFormat = 'srt' | 'vtt' | 'ass' | 'mp4_burned' | 'zip'
+export type ExportFormat = string
 
 export interface JobOptions {
   language: string | null
@@ -16,6 +16,13 @@ export interface JobOptions {
   enable_subtitles: boolean
   enable_burned_video: boolean
   ui_locale: 'ru' | 'en'
+  streaming_mode: 'dual_pass_hq' | 'final_only_hq' | 'live_only_fast'
+  camera_mode: boolean
+  auto_stop_seconds: number
+  show_face_mask_preview: boolean
+  output_video_format: string
+  subtitle_embed_mode: 'auto' | 'embedded' | 'sidecar' | 'burned'
+  subtitle_style: Record<string, unknown>
 }
 
 export interface StageRuntime {
@@ -71,6 +78,8 @@ export interface PersonTrackStats {
 
 export interface PersonProfile {
   person_id: string
+  display_name: string | null
+  display_name_confidence: number
   portrait_path: string | null
   track_stats: PersonTrackStats
   key_comments: string[]
@@ -86,4 +95,18 @@ export interface VideoReport {
 
 export interface JobLibraryResponse {
   items: JobView[]
+}
+
+export interface VideoFormatCapability {
+  format: string
+  ffmpeg_muxer: string
+  curated: boolean
+  can_embed_subtitles: boolean
+  preferred_subtitle_codec: string | null
+  notes: string | null
+}
+
+export interface FormatCapabilitiesResponse {
+  curated: VideoFormatCapability[]
+  all_muxers: VideoFormatCapability[]
 }

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 
 JobStatus = Literal["queued", "running", "completed", "failed"]
 QualityPreset = Literal["max_quality", "balanced", "max_speed"]
-ExportFormat = Literal["srt", "vtt", "ass", "mp4_burned", "zip"]
+ExportFormat = str
+StreamingMode = Literal["dual_pass_hq", "final_only_hq", "live_only_fast"]
+SubtitleEmbedMode = Literal["auto", "embedded", "sidecar", "burned"]
 
 
 class JobOptions(BaseModel):
@@ -39,6 +41,13 @@ class JobOptions(BaseModel):
     enable_subtitles: bool = True
     enable_burned_video: bool = True
     ui_locale: Literal["ru", "en"] = "en"
+    streaming_mode: StreamingMode = "dual_pass_hq"
+    camera_mode: bool = False
+    auto_stop_seconds: int = 20
+    show_face_mask_preview: bool = False
+    output_video_format: str = "mp4"
+    subtitle_embed_mode: SubtitleEmbedMode = "auto"
+    subtitle_style: dict[str, Any] = Field(default_factory=dict)
 
 
 class StageRuntime(BaseModel):
@@ -86,6 +95,8 @@ class PersonTrackStats(BaseModel):
 
 class PersonProfile(BaseModel):
     person_id: str
+    display_name: str | None = None
+    display_name_confidence: float = 0.0
     portrait_path: str | None = None
     track_stats: PersonTrackStats
     key_comments: list[str] = Field(default_factory=list)
@@ -140,3 +151,17 @@ class ExportRequest(BaseModel):
 
 class JobLibraryResponse(BaseModel):
     items: list[JobView]
+
+
+class VideoFormatCapability(BaseModel):
+    format: str
+    ffmpeg_muxer: str
+    curated: bool = False
+    can_embed_subtitles: bool = False
+    preferred_subtitle_codec: str | None = None
+    notes: str | None = None
+
+
+class FormatCapabilitiesResponse(BaseModel):
+    curated: list[VideoFormatCapability] = Field(default_factory=list)
+    all_muxers: list[VideoFormatCapability] = Field(default_factory=list)

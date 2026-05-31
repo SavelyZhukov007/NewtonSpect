@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Annotated, BinaryIO
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import (
@@ -28,13 +29,16 @@ from ..schemas import (
     ArtifactsResponse,
     CreateJobResponse,
     ExportRequest,
+    FormatCapabilitiesResponse,
     JobLibraryResponse,
     JobOptions,
+    VideoFormatCapability,
     JobView,
     PeopleResponse,
     ReportResponse,
 )
 from ..services.exporter import create_zip_bundle, filter_files_for_formats
+from ..services.media import MediaService
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
@@ -169,6 +173,15 @@ def _as_string(value: object) -> str | None:
     return str(value).strip() or None
 
 
+def _as_int(value: object, default: int) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_export_formats(value: object) -> list[str]:
     if isinstance(value, str):
         return [item.strip() for item in value.split(",") if item.strip()]
@@ -195,6 +208,13 @@ def _build_options(
     enable_burned_video: bool,
     enable_mask_overlay: bool,
     ui_locale: str,
+    streaming_mode: str = "dual_pass_hq",
+    camera_mode: bool = False,
+    auto_stop_seconds: int = 20,
+    show_face_mask_preview: bool = False,
+    output_video_format: str = "mp4",
+    subtitle_embed_mode: str = "auto",
+    subtitle_style: dict[str, object] | None = None,
 ) -> JobOptions:
     return JobOptions(
         language=language,
@@ -209,6 +229,13 @@ def _build_options(
         enable_burned_video=enable_burned_video,
         enable_mask_overlay=enable_mask_overlay,
         ui_locale="ru" if ui_locale == "ru" else "en",
+        streaming_mode=streaming_mode if streaming_mode in {"dual_pass_hq", "final_only_hq", "live_only_fast"} else "dual_pass_hq",  # type: ignore[arg-type]
+        camera_mode=camera_mode,
+        auto_stop_seconds=max(5, min(int(auto_stop_seconds), 120)),
+        show_face_mask_preview=show_face_mask_preview,
+        output_video_format=(output_video_format or "mp4").lower(),
+        subtitle_embed_mode=subtitle_embed_mode if subtitle_embed_mode in {"auto", "embedded", "sidecar", "burned"} else "auto",  # type: ignore[arg-type]
+        subtitle_style=subtitle_style or {},
     )
 
 
@@ -272,6 +299,44 @@ def _job_options_from_payload(container: Container, payload: dict[str, object]) 
             if payload.get("ui_locale") is not None
             else payload.get("uiLocale") or "en"
         ),
+        streaming_mode=str(
+            payload.get("streaming_mode")
+            if payload.get("streaming_mode") is not None
+            else payload.get("streamingMode") or "dual_pass_hq"
+        ),
+        camera_mode=_as_bool(
+            payload.get("camera_mode")
+            if payload.get("camera_mode") is not None
+            else payload.get("cameraMode"),
+            False,
+        ),
+        auto_stop_seconds=_as_int(
+            payload.get("auto_stop_seconds")
+            if payload.get("auto_stop_seconds") is not None
+            else payload.get("autoStopSeconds"),
+            20,
+        ),
+        show_face_mask_preview=_as_bool(
+            payload.get("show_face_mask_preview")
+            if payload.get("show_face_mask_preview") is not None
+            else payload.get("showFaceMaskPreview"),
+            False,
+        ),
+        output_video_format=str(
+            payload.get("output_video_format")
+            if payload.get("output_video_format") is not None
+            else payload.get("outputVideoFormat") or "mp4"
+        ),
+        subtitle_embed_mode=str(
+            payload.get("subtitle_embed_mode")
+            if payload.get("subtitle_embed_mode") is not None
+            else payload.get("subtitleEmbedMode") or "auto"
+        ),
+        subtitle_style=payload.get("subtitle_style")
+        if isinstance(payload.get("subtitle_style"), dict)
+        else payload.get("subtitleStyle")
+        if isinstance(payload.get("subtitleStyle"), dict)
+        else {},
     )
 
 
@@ -321,6 +386,13 @@ async def create_job(
     enable_burned_video: Annotated[bool, Form()] = True,
     enable_mask_overlay: Annotated[bool, Form()] = False,
     ui_locale: Annotated[str, Form()] = "en",
+    streaming_mode: Annotated[str, Form()] = "dual_pass_hq",
+    camera_mode: Annotated[bool, Form()] = False,
+    auto_stop_seconds: Annotated[int, Form()] = 20,
+    show_face_mask_preview: Annotated[bool, Form()] = False,
+    output_video_format: Annotated[str, Form()] = "mp4",
+    subtitle_embed_mode: Annotated[str, Form()] = "auto",
+    subtitle_style_json: Annotated[str | None, Form()] = None,
 ) -> CreateJobResponse:
     container = _container(request)
     data = await video.read()
@@ -329,6 +401,14 @@ async def create_job(
 
     filename = Path(video.filename or "uploaded_video.mp4").name
     parsed_formats = [item.strip() for item in export_formats.split(",") if item.strip()]
+    subtitle_style: dict[str, object] = {}
+    if subtitle_style_json:
+        try:
+            raw_style = json.loads(subtitle_style_json)
+            if isinstance(raw_style, dict):
+                subtitle_style = raw_style
+        except json.JSONDecodeError:
+            subtitle_style = {}
     options = _build_options(
         container,
         language=language,
@@ -342,6 +422,13 @@ async def create_job(
         enable_burned_video=enable_burned_video,
         enable_mask_overlay=enable_mask_overlay,
         ui_locale=ui_locale,
+        streaming_mode=streaming_mode,
+        camera_mode=camera_mode,
+        auto_stop_seconds=auto_stop_seconds,
+        show_face_mask_preview=show_face_mask_preview,
+        output_video_format=output_video_format,
+        subtitle_embed_mode=subtitle_embed_mode,
+        subtitle_style=subtitle_style,
     )
 
     job_id = str(uuid4())
@@ -501,6 +588,42 @@ def list_jobs(request: Request, limit: int = 100) -> JobLibraryResponse:
     return JobLibraryResponse(items=items)
 
 
+@router.get("/capabilities/formats", response_model=FormatCapabilitiesResponse)
+def get_format_capabilities(request: Request) -> FormatCapabilitiesResponse:
+    container = _container(request)
+    media = MediaService()
+    curated_rows = media.curated_video_formats()
+    curated = [
+        VideoFormatCapability(
+            format=str(row["format"]),
+            ffmpeg_muxer=str(row["ffmpeg_muxer"]),
+            curated=True,
+            can_embed_subtitles=bool(row["can_embed_subtitles"]),
+            preferred_subtitle_codec=(
+                str(row["preferred_subtitle_codec"]) if row["preferred_subtitle_codec"] else None
+            ),
+            notes=str(row["notes"]) if row["notes"] else None,
+        )
+        for row in curated_rows
+    ]
+    curated_muxers = {item.ffmpeg_muxer for item in curated}
+    all_muxers = [
+        VideoFormatCapability(
+            format=muxer,
+            ffmpeg_muxer=muxer,
+            curated=muxer in curated_muxers,
+            can_embed_subtitles=muxer in {"mp4", "mov", "matroska"},
+            preferred_subtitle_codec=(
+                "mov_text" if muxer in {"mp4", "mov"} else "srt" if muxer == "matroska" else None
+            ),
+            notes=None,
+        )
+        for muxer in media.list_ffmpeg_muxers()
+    ]
+    _ = container  # explicit use to preserve container lifecycle expectations
+    return FormatCapabilitiesResponse(curated=curated, all_muxers=all_muxers)
+
+
 @router.get("/{job_id}", response_model=JobView)
 def get_job(job_id: str, request: Request) -> JobView:
     return _to_job_view(_container(request), job_id)
@@ -570,4 +693,19 @@ def download_artifact(job_id: str, artifact_name: str, request: Request) -> File
     path = Path(match.path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact file missing on disk")
-    return FileResponse(path=path, filename=match.name, media_type=match.mime_type)
+    file_size = path.stat().st_size
+    safe_name = match.name.replace('"', "_")
+    return FileResponse(
+        path=path,
+        filename=safe_name,
+        media_type=match.mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{safe_name}"; '
+                f"filename*=UTF-8''{quote(safe_name)}"
+            ),
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        },
+    )

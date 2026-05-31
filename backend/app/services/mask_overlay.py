@@ -42,6 +42,13 @@ class _ModelInfo:
 
 
 @dataclass
+class _TrackIdentity:
+    person_id: str
+    embedding_centroid: np.ndarray
+    samples: int = 1
+
+
+@dataclass
 class MaskOverlayResult:
     output_video_path: Path
     metadata_path: Path
@@ -50,8 +57,16 @@ class MaskOverlayResult:
 
 
 class OpenVINOMaskOverlayRenderer:
-    def __init__(self, models_dir: Path, preferred_devices: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        models_dir: Path,
+        preferred_devices: tuple[str, ...],
+        model_search_paths: tuple[Path, ...] | None = None,
+    ) -> None:
         self.models_dir = models_dir
+        self.model_search_paths = tuple(
+            path.resolve() for path in (model_search_paths or (models_dir,))
+        )
         self.core = Core()
         self.device = self._resolve_device(preferred_devices)
         self.media = MediaService()
@@ -63,12 +78,15 @@ class OpenVINOMaskOverlayRenderer:
         self.haar_detector = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        self.person_tracks: dict[str, _TrackIdentity] = {}
+        self.next_person_index = 1
 
     def render(
         self,
         input_video_path: Path,
         output_dir: Path,
         *,
+        person_display_names: dict[str, str] | None = None,
         progress_callback: Callable[[int, int, float], None] | None = None,
     ) -> MaskOverlayResult:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -98,15 +116,15 @@ class OpenVINOMaskOverlayRenderer:
         started = time.perf_counter()
         frame_idx = 0
         frame_samples: list[dict[str, Any]] = []
+        person_display_names = person_display_names or {}
 
         try:
             while True:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                annotated, sample = self._annotate_frame(frame, frame_idx, fps)
+                annotated, sample = self._annotate_frame(frame, frame_idx, fps, person_display_names)
                 writer.write(annotated)
-
                 if frame_idx % max(int(fps), 1) == 0:
                     frame_samples.append(sample)
 
@@ -128,6 +146,7 @@ class OpenVINOMaskOverlayRenderer:
             "models_missing": models_missing,
             "frames_processed": frame_idx,
             "frame_samples": frame_samples,
+            "tracks": list(self.person_tracks.keys()),
         }
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         return MaskOverlayResult(
@@ -145,8 +164,11 @@ class OpenVINOMaskOverlayRenderer:
         return "CPU"
 
     def _find_model_xml(self, model_name: str) -> Path | None:
-        matches = list(self.models_dir.rglob(f"{model_name}.xml"))
-        return matches[0] if matches else None
+        for root in self.model_search_paths:
+            matches = list(root.rglob(f"{model_name}.xml"))
+            if matches:
+                return matches[0]
+        return None
 
     def _load_model(self, model_name: str) -> _ModelInfo | None:
         xml_path = self._find_model_xml(model_name)
@@ -182,9 +204,6 @@ class OpenVINOMaskOverlayRenderer:
 
     def _detect_faces(self, frame: np.ndarray) -> list[tuple[int, int, int, int, float]]:
         model = self.models.get("face-detection-retail-0004")
-        if model is None:
-            # fallback to 0005 if present from previous pipeline setup
-            model = self.models.get("face-detection-retail-0005")
         if model is not None:
             outputs = self._infer_outputs(model, frame)
             first = next(iter(outputs.values()))
@@ -225,8 +244,29 @@ class OpenVINOMaskOverlayRenderer:
             y2 = min(int(det[6] * h), h - 1)
             if x2 <= x1 or y2 <= y1:
                 continue
+            area_ratio = ((x2 - x1) * (y2 - y1)) / max(float(w * h), 1.0)
+            if area_ratio < 0.01 or area_ratio > 0.95:
+                continue
+            aspect = (x2 - x1) / max(float(y2 - y1), 1.0)
+            if aspect < 0.15 or aspect > 1.25:
+                continue
             boxes.append((x1, y1, x2, y2, conf))
         return boxes
+
+    def _person_embedding(self, crop: np.ndarray) -> np.ndarray:
+        model = self.models.get("person-reidentification-retail-0277")
+        if model is None:
+            return self._hist_embedding(crop)
+        outputs = self._infer_outputs(model, crop)
+        vec = next(iter(outputs.values())).reshape(-1).astype(np.float32)
+        return vec / (np.linalg.norm(vec) + 1e-8)
+
+    @staticmethod
+    def _hist_embedding(crop: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+        return hist / (np.linalg.norm(hist) + 1e-8)
 
     def _age_gender(self, face_crop: np.ndarray) -> tuple[int | None, str | None]:
         model = self.models.get("age-gender-recognition-retail-0013")
@@ -235,7 +275,7 @@ class OpenVINOMaskOverlayRenderer:
         outputs = self._infer_outputs(model, face_crop)
         age = None
         gender = None
-        for name, arr in outputs.items():
+        for arr in outputs.values():
             flat = arr.reshape(-1)
             if flat.size == 1:
                 age = int(max(min(float(flat[0]) * 100.0, 99.0), 0.0))
@@ -265,34 +305,77 @@ class OpenVINOMaskOverlayRenderer:
         values = next(iter(outputs.values())).reshape(-1)
         if values.size < 4:
             return []
-        pairs = []
+        points: list[tuple[float, float]] = []
         for idx in range(0, values.size - 1, 2):
             x = float(values[idx])
             y = float(values[idx + 1])
             if math.isnan(x) or math.isnan(y):
                 continue
-            pairs.append((x, y))
-        return pairs
+            points.append((x, y))
+        return points
+
+    def _match_person_track(self, embedding: np.ndarray) -> str:
+        best_id: str | None = None
+        best_score = -1.0
+        for track_id, track in self.person_tracks.items():
+            score = float(np.dot(track.embedding_centroid, embedding))
+            if score > best_score:
+                best_score = score
+                best_id = track_id
+
+        threshold = 0.58 if "person-reidentification-retail-0277" in self.models else 0.82
+        if best_id is None or best_score < threshold:
+            person_id = f"P{self.next_person_index:03d}"
+            self.next_person_index += 1
+            self.person_tracks[person_id] = _TrackIdentity(person_id=person_id, embedding_centroid=embedding)
+            return person_id
+
+        track = self.person_tracks[best_id]
+        track.samples += 1
+        alpha = 1.0 / track.samples
+        track.embedding_centroid = (1.0 - alpha) * track.embedding_centroid + alpha * embedding
+        track.embedding_centroid = track.embedding_centroid / (
+            np.linalg.norm(track.embedding_centroid) + 1e-8
+        )
+        return best_id
 
     def _annotate_frame(
-        self, frame: np.ndarray, frame_idx: int, fps: float
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        fps: float,
+        person_display_names: dict[str, str],
     ) -> tuple[np.ndarray, dict[str, Any]]:
         out = frame.copy()
         h, w = out.shape[:2]
         persons = self._detect_persons(out)
         faces = self._detect_faces(out)
 
+        person_infos: list[dict[str, Any]] = []
         for x1, y1, x2, y2, conf in persons:
+            crop = out[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            track_id = self._match_person_track(self._person_embedding(crop))
+            label = person_display_names.get(track_id, track_id)
             cv2.rectangle(out, (x1, y1), (x2, y2), (29, 203, 101), 2)
             cv2.putText(
                 out,
-                f"person {conf:.2f}",
+                f"{label} {conf:.2f}",
                 (x1, max(y1 - 6, 14)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (29, 203, 101),
                 1,
                 cv2.LINE_AA,
+            )
+            person_infos.append(
+                {
+                    "person_id": track_id,
+                    "label": label,
+                    "confidence": round(conf, 4),
+                    "bbox": [x1, y1, x2, y2],
+                }
             )
 
         face_infos: list[dict[str, Any]] = []
@@ -364,8 +447,7 @@ class OpenVINOMaskOverlayRenderer:
 
         sample = {
             "time_sec": round(frame_idx / max(fps, 1.0), 3),
-            "persons": len(persons),
+            "persons": person_infos,
             "faces": face_infos,
         }
         return out, sample
-
