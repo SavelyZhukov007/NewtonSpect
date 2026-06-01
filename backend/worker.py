@@ -9,7 +9,7 @@ from app.bootstrap import build_container
 
 def main() -> None:
     container = build_container()
-    pipeline = container.build_pipeline()
+    pipeline = None
     worker_id = f"{socket.gethostname()}-{str(uuid4())[:8]}"
     print(f"[worker] started id={worker_id}")
 
@@ -24,6 +24,8 @@ def main() -> None:
 
         print(f"[worker] processing job={job.id}")
         try:
+            if pipeline is None:
+                pipeline = container.build_pipeline()
             pipeline.process(job)
             print(f"[worker] completed job={job.id}")
         except Exception as exc:  # noqa: BLE001
@@ -40,4 +42,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

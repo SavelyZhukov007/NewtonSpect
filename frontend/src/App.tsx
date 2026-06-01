@@ -11,7 +11,6 @@ import {
   downloadArtifact,
   fetchArtifactBlob,
   fetchArtifactText,
-  fetchArtifacts,
   fetchFormatCapabilities,
   fetchJob,
   fetchJobLibrary,
@@ -395,12 +394,12 @@ export default function App() {
 
   const [language, setLanguage] = useState('')
   const [autoDetectLanguage, setAutoDetectLanguage] = useState(true)
-  const [qualityPreset, setQualityPreset] = useState<QualityPreset>('max_quality')
-  const [detectPeople, setDetectPeople] = useState(true)
-  const [generateSummary, setGenerateSummary] = useState(true)
-  const [enableActiveSpeakerModel, setEnableActiveSpeakerModel] = useState(true)
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>('balanced')
+  const [detectPeople, setDetectPeople] = useState(false)
+  const [generateSummary, setGenerateSummary] = useState(false)
+  const [enableActiveSpeakerModel, setEnableActiveSpeakerModel] = useState(false)
   const [enableSubtitles, setEnableSubtitles] = useState(true)
-  const [enableBurnedVideo, setEnableBurnedVideo] = useState(true)
+  const [enableBurnedVideo, setEnableBurnedVideo] = useState(false)
   const [enableMaskOverlay, setEnableMaskOverlay] = useState(false)
   const [streamingMode, setStreamingMode] = useState<StreamingMode>('dual_pass_hq')
   const [cameraMode, setCameraMode] = useState(false)
@@ -412,22 +411,16 @@ export default function App() {
   const [generateShorts, setGenerateShorts] = useState(false)
   const [shortsClipCount, setShortsClipCount] = useState(3)
   const [shortsClipDurationSeconds, setShortsClipDurationSeconds] = useState(35)
-  const [translateLanguages, setTranslateLanguages] = useState<string[]>(['en', 'es', 'de', 'fr'])
-  const [enableFactCheck, setEnableFactCheck] = useState(true)
+  const [translateLanguages, setTranslateLanguages] = useState<string[]>([])
+  const [enableFactCheck, setEnableFactCheck] = useState(false)
   const [enableChapters, setEnableChapters] = useState(true)
   const [enableQuotes, setEnableQuotes] = useState(true)
   const [enableQualityScore, setEnableQualityScore] = useState(true)
-  const [platformPresets, setPlatformPresets] = useState<string[]>([
-    'youtube',
-    'tiktok',
-    'vk',
-    'telegram'
-  ])
+  const [platformPresets, setPlatformPresets] = useState<string[]>([])
   const [selectedExportFormats, setSelectedExportFormats] = useState<string[]>([
     'srt',
     'vtt',
-    'ass',
-    'mp4_burned'
+    'ass'
   ])
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyleState>({
     fontSize: 36,
@@ -461,6 +454,7 @@ export default function App() {
   const cameraWsRef = useRef<CameraWsContext | null>(null)
   const finalizeCameraJobRef = useRef<(() => Promise<void>) | null>(null)
   const cameraFinalizingRef = useRef(false)
+  const jobPollInFlightRef = useRef(false)
   const cameraChunksRef = useRef<Blob[]>([])
   const cameraTickerRef = useRef<number | null>(null)
   const cameraAutoStopRef = useRef<number | null>(null)
@@ -508,7 +502,6 @@ export default function App() {
   const hydrateJobMaterials = useCallback(async (jobId: string) => {
     const [
       freshJob,
-      freshArtifacts,
       freshPeople,
       freshReport,
       freshChapters,
@@ -520,7 +513,6 @@ export default function App() {
       subtitlePayload
     ] = await Promise.all([
       fetchJob(jobId),
-      fetchArtifacts(jobId),
       fetchPeople(jobId),
       fetchReport(jobId),
       fetchChapters(jobId),
@@ -532,7 +524,7 @@ export default function App() {
       fetchSubtitles(jobId)
     ])
     setJob(freshJob)
-    setArtifacts(freshArtifacts)
+    setArtifacts(freshJob.artifacts)
     setPeople(freshPeople)
     setReport(freshReport)
     setChapters(freshChapters)
@@ -620,15 +612,21 @@ export default function App() {
   )
 
   useEffect(() => {
-    if (!selectedJobId || !job) return
-    if (job.status === 'completed' || job.status === 'failed') return
+    if (!selectedJobId) return
+    const jobStatus = job?.status
+    if (!jobStatus) return
+    if (jobStatus === 'completed' || jobStatus === 'failed') return
 
     const timer = window.setInterval(() => {
+      if (jobPollInFlightRef.current) {
+        return
+      }
+      jobPollInFlightRef.current = true
       void (async () => {
         try {
           const nextJob = await fetchJob(selectedJobId)
           setJob(nextJob)
-          setArtifacts(await fetchArtifacts(selectedJobId))
+          setArtifacts(nextJob.artifacts)
           if (nextJob.status === 'completed' || nextJob.status === 'failed') {
             const [
               freshPeople,
@@ -665,24 +663,49 @@ export default function App() {
           }
         } catch (err) {
           setError((err as Error).message)
+        } finally {
+          jobPollInFlightRef.current = false
         }
       })()
-    }, 1800)
+    }, 2200)
 
-    return () => window.clearInterval(timer)
-  }, [selectedJobId, job, loadLibrary])
+    return () => {
+      window.clearInterval(timer)
+      jobPollInFlightRef.current = false
+    }
+  }, [selectedJobId, job?.status, loadLibrary])
 
   useEffect(() => {
     if (!selectedJobId || !currentSubtitleArtifact) return
-    void (async () => {
+    let cancelled = false
+
+    const loadText = async () => {
       try {
         const text = await fetchArtifactText(selectedJobId, currentSubtitleArtifact.name)
-        setSubtitleText(text)
+        if (!cancelled) {
+          setSubtitleText(text)
+        }
       } catch {
+        if (cancelled) {
+          return
+        }
+        if (job?.status === 'running' || job?.status === 'queued') {
+          window.setTimeout(() => {
+            void loadText()
+          }, 1400)
+          return
+        }
         setSubtitleText('')
       }
+    }
+
+    void (async () => {
+      await loadText()
     })()
-  }, [selectedJobId, currentSubtitleArtifact])
+    return () => {
+      cancelled = true
+    }
+  }, [selectedJobId, currentSubtitleArtifact, job?.status])
 
   useEffect(() => {
     return () => {
@@ -994,19 +1017,19 @@ export default function App() {
             output_video_format: outputVideoFormat,
             subtitle_embed_mode: subtitleEmbedMode,
             subtitle_style: subtitleStyle,
-            generate_shorts: false,
+            generate_shorts: generateShorts,
             shorts_preset: {
-              clip_count: 3,
-              clip_duration_seconds: 35
+              clip_count: shortsClipCount,
+              clip_duration_seconds: shortsClipDurationSeconds
             },
-            privacy_mode: 'auto_risk',
-            translate_languages: ['en', 'es', 'de', 'fr'],
-            enable_fact_check: true,
-            enable_chapters: true,
-            enable_quotes: true,
-            enable_quality_score: true,
-            platform_presets: ['youtube', 'tiktok', 'vk', 'telegram'],
-            enable_live_draft: true
+            privacy_mode: privacyMode,
+            translate_languages: translateLanguages,
+            enable_fact_check: enableFactCheck,
+            enable_chapters: enableChapters,
+            enable_quotes: enableQuotes,
+            enable_quality_score: enableQualityScore,
+            platform_presets: platformPresets,
+            enable_live_draft: streamingMode !== 'final_only_hq'
           }
         })
       )
@@ -1044,17 +1067,27 @@ export default function App() {
     enableBurnedVideo,
     enableMaskOverlay,
     enableSubtitles,
+    enableFactCheck,
+    enableChapters,
+    enableQuotes,
+    enableQualityScore,
+    generateShorts,
     generateSummary,
     language,
     loadLibrary,
     locale,
     outputVideoFormat,
+    platformPresets,
+    privacyMode,
     qualityPreset,
     selectedExportFormats,
     showFaceMaskPreview,
+    shortsClipCount,
+    shortsClipDurationSeconds,
     streamingMode,
     subtitleEmbedMode,
-    subtitleStyle
+    subtitleStyle,
+    translateLanguages
   ])
 
   const handleStopRecording = useCallback(async () => {
@@ -1207,7 +1240,9 @@ export default function App() {
     clearRuntimeMessages()
     try {
       await buildShorts(selectedJobId, shortsClipCount, shortsClipDurationSeconds)
-      setArtifacts(await fetchArtifacts(selectedJobId))
+      const refreshed = await fetchJob(selectedJobId)
+      setJob(refreshed)
+      setArtifacts(refreshed.artifacts)
       setInfo(tx(locale, 'Shorts сгенерированы.', 'Shorts generated.'))
     } catch (err) {
       setError((err as Error).message)
@@ -1226,7 +1261,9 @@ export default function App() {
       setSubtitleEditorSegments(payload.segments)
       setSubtitleRevisions(payload.revisions)
       setInfo(tx(locale, 'Субтитры сохранены.', 'Subtitles saved.'))
-      setArtifacts(await fetchArtifacts(selectedJobId))
+      const refreshed = await fetchJob(selectedJobId)
+      setJob(refreshed)
+      setArtifacts(refreshed.artifacts)
     } catch (err) {
       setError((err as Error).message)
     }

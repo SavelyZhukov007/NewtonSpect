@@ -10,6 +10,7 @@ from ..repository import JobRecord, JobRepository
 from ..schemas import (
     Artifact,
     FactCheckItem,
+    QualityScore,
     ShortsExport,
     TranscriptSegment,
     TranslationTrack,
@@ -37,6 +38,7 @@ from .shorts import ShortsGenerator
 from .speaker import ActiveSpeakerAttributor
 from .subtitles import write_subtitle_files
 from .translator import LocalTranslator
+from .types import VisionAnalysisResult
 
 
 STAGE_WINDOWS: dict[str, tuple[float, float]] = {
@@ -66,29 +68,55 @@ class PipelineRunner:
         self.storage = storage
         self.media = MediaService()
         self.asr = ASRService(model_name=settings.whisper_model)
-        self.people_analyzer = OpenVINOPeopleAnalyzer(
-            models_dir=settings.openvino_models_dir,
-            preferred_devices=settings.preferred_openvino_devices,
-            model_search_paths=settings.openvino_models_search_paths,
-        )
-        self.speaker_attributor = ActiveSpeakerAttributor(settings.openvino_models_dir)
-        self.report_generator = ReportGenerator(
-            OllamaClient(settings.ollama_base_url, settings.ollama_model)
-        )
-        self.translator = LocalTranslator(
-            OllamaClient(settings.ollama_base_url, settings.ollama_model)
-        )
+        self.people_analyzer: OpenVINOPeopleAnalyzer | None = None
+        self.speaker_attributor: ActiveSpeakerAttributor | None = None
+        self.report_generator: ReportGenerator | None = None
+        self.translator: LocalTranslator | None = None
         self.kb = OfflineKnowledgeBase(repository=repository, kb_root=storage.kb_dir)
         self.shorts_generator = ShortsGenerator(self.media)
-        self.mask_renderer = OpenVINOMaskOverlayRenderer(
-            settings.openvino_models_dir,
-            settings.preferred_openvino_devices,
-            model_search_paths=settings.openvino_models_search_paths,
-        )
+        self.mask_renderer: OpenVINOMaskOverlayRenderer | None = None
+
+    def _get_people_analyzer(self) -> OpenVINOPeopleAnalyzer:
+        if self.people_analyzer is None:
+            self.people_analyzer = OpenVINOPeopleAnalyzer(
+                models_dir=self.settings.openvino_models_dir,
+                preferred_devices=self.settings.preferred_openvino_devices,
+                model_search_paths=self.settings.openvino_models_search_paths,
+            )
+        return self.people_analyzer
+
+    def _get_speaker_attributor(self) -> ActiveSpeakerAttributor:
+        if self.speaker_attributor is None:
+            self.speaker_attributor = ActiveSpeakerAttributor(self.settings.openvino_models_dir)
+        return self.speaker_attributor
+
+    def _get_report_generator(self) -> ReportGenerator:
+        if self.report_generator is None:
+            self.report_generator = ReportGenerator(
+                OllamaClient(self.settings.ollama_base_url, self.settings.ollama_model)
+            )
+        return self.report_generator
+
+    def _get_translator(self) -> LocalTranslator:
+        if self.translator is None:
+            self.translator = LocalTranslator(
+                OllamaClient(self.settings.ollama_base_url, self.settings.ollama_model)
+            )
+        return self.translator
+
+    def _get_mask_renderer(self) -> OpenVINOMaskOverlayRenderer:
+        if self.mask_renderer is None:
+            self.mask_renderer = OpenVINOMaskOverlayRenderer(
+                self.settings.openvino_models_dir,
+                self.settings.preferred_openvino_devices,
+                model_search_paths=self.settings.openvino_models_search_paths,
+            )
+        return self.mask_renderer
 
     def process(self, job: JobRecord) -> None:
         options = self.repository.decode_options(job.options_json)
         artifacts: list[Artifact] = self.repository.decode_artifacts(job.artifacts_json)
+        warnings: list[str] = []
         input_video = Path(job.input_video_path)
         self.storage.job_dir(job.id)
         previous = self.repository.previous_job_for_fingerprint(
@@ -232,6 +260,7 @@ class PipelineRunner:
         self.repository.set_artifacts(job.id, artifacts)
 
         # Stage: vision
+        vision_result = VisionAnalysisResult(people=[], samples=[], device_used="disabled")
         if options.detect_people:
             self._stage_update(job.id, "vision", 0.02, "Detecting and clustering people")
 
@@ -249,44 +278,65 @@ class PipelineRunner:
                     eta_seconds=eta,
                 )
 
-            vision_result = self.people_analyzer.analyze(
-                input_video,
-                people_output_dir=people_dir,
-                progress_callback=_vision_progress,
-            )
-            self._stage_update(
-                job.id,
-                "vision",
-                1.0,
-                f"Vision done on device {vision_result.device_used}",
-                eta_seconds=0.0,
-            )
+            try:
+                vision_result = self._get_people_analyzer().analyze(
+                    input_video,
+                    people_output_dir=people_dir,
+                    progress_callback=_vision_progress,
+                )
+                self._stage_update(
+                    job.id,
+                    "vision",
+                    1.0,
+                    f"Vision done on device {vision_result.device_used}",
+                    eta_seconds=0.0,
+                )
+            except Exception as exc:
+                warning = f"Vision stage failed; continuing without people analytics: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(job.id, "vision", warning, 0.72, level="warning")
+                self._stage_update(job.id, "vision", 1.0, "Vision disabled due to error")
+                vision_result = VisionAnalysisResult(people=[], samples=[], device_used="error")
         else:
-            from .types import VisionAnalysisResult
-
-            vision_result = VisionAnalysisResult(people=[], samples=[], device_used="disabled")
             self._stage_update(job.id, "vision", 1.0, "Vision disabled")
 
         # Stage: speaker attribution
         if options.detect_people and options.enable_active_speaker_model and vision_result.samples:
             self._stage_update(job.id, "speaker_attribution", 0.10, "Assigning speaking segments")
-            attribution = self.speaker_attributor.assign_speakers(
-                segments=segments,
-                samples=vision_result.samples,
-                use_asd_model=options.enable_active_speaker_model,
-            )
-            segments = attribution.segments
-            if options.enable_subtitles:
-                write_subtitle_files(segments, srt_path=srt_path, vtt_path=vtt_path, ass_path=ass_path)
-            self.repository.set_subtitle_segments(
-                job.id, segments, editor_device="system", note="speaker-attribution"
-            )
-            self._stage_update(
-                job.id,
-                "speaker_attribution",
-                1.0,
-                f"Speaker attribution method: {attribution.method}",
-            )
+            try:
+                attribution = self._get_speaker_attributor().assign_speakers(
+                    segments=segments,
+                    samples=vision_result.samples,
+                    use_asd_model=options.enable_active_speaker_model,
+                )
+                segments = attribution.segments
+                if options.enable_subtitles:
+                    write_subtitle_files(segments, srt_path=srt_path, vtt_path=vtt_path, ass_path=ass_path)
+                self.repository.set_subtitle_segments(
+                    job.id, segments, editor_device="system", note="speaker-attribution"
+                )
+                self._stage_update(
+                    job.id,
+                    "speaker_attribution",
+                    1.0,
+                    f"Speaker attribution method: {attribution.method}",
+                )
+            except Exception as exc:
+                warning = f"Speaker attribution failed; continuing with base transcript: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(
+                    job.id, "speaker_attribution", warning, 0.78, level="warning"
+                )
+                attribution = type("Attr", (), {"method": "failed"})()
+                self.repository.set_subtitle_segments(
+                    job.id, segments, editor_device="system", note="speaker-failed"
+                )
+                self._stage_update(
+                    job.id,
+                    "speaker_attribution",
+                    1.0,
+                    "Speaker attribution failed; used base transcript",
+                )
         else:
             attribution = type("Attr", (), {"method": "disabled"})()
             self.repository.set_subtitle_segments(
@@ -303,17 +353,29 @@ class PipelineRunner:
 
         # Stage: report
         self._stage_update(job.id, "report", 0.03, "Generating AI report")
-        report = (
-            self.report_generator.generate(segments=segments, people=vision_result.people)
-            if options.generate_summary
-            else VideoReport(
-                summary_md="Summary generation disabled.",
-                key_topics=[],
-                latex_blocks=[],
-                people_highlights={},
-                raw_markdown="",
-            )
+        report = VideoReport(
+            summary_md="Summary generation disabled.",
+            key_topics=[],
+            latex_blocks=[],
+            people_highlights={},
+            raw_markdown="",
         )
+        if options.generate_summary:
+            try:
+                report = self._get_report_generator().generate(
+                    segments=segments, people=vision_result.people
+                )
+            except Exception as exc:
+                warning = f"Summary generation failed; continuing with transcript outputs only: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(job.id, "report", warning, 0.82, level="warning")
+                report = VideoReport(
+                    summary_md="Summary generation failed. Transcript and subtitle artifacts are available.",
+                    key_topics=[],
+                    latex_blocks=[],
+                    people_highlights={},
+                    raw_markdown="",
+                )
         for person in vision_result.people:
             person.key_comments = report.people_highlights.get(person.person_id, [])
 
@@ -327,23 +389,31 @@ class PipelineRunner:
                 transcript_duration=input_duration,
             )
             if options.enable_quality_score
-            else compute_quality_score(
-                segments=segments,
-                people=vision_result.people,
-                report=report,
-                transcript_duration=input_duration,
-            )
+            else QualityScore(notes=["Quality score generation disabled by user"])
         )
 
         translation_tracks: list[TranslationTrack] = []
         for language in sorted(set([lang.lower() for lang in options.translate_languages])):
-            translation_tracks.append(self.translator.translate(segments, target_language=language))
+            try:
+                translation_tracks.append(
+                    self._get_translator().translate(segments, target_language=language)
+                )
+            except Exception as exc:
+                warning = f"Translation for '{language}' failed: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(job.id, "report", warning, 0.85, level="warning")
 
         fact_checks: list[FactCheckItem] = []
         if options.enable_fact_check:
-            claims = extract_claim_candidates(segments)
-            kb_chunks = self.repository.list_kb_chunks()
-            fact_checks = run_offline_fact_check(claims, kb_chunks)
+            try:
+                claims = extract_claim_candidates(segments)
+                kb_chunks = self.repository.list_kb_chunks()
+                fact_checks = run_offline_fact_check(claims, kb_chunks)
+            except Exception as exc:
+                warning = f"Fact-check stage failed: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(job.id, "report", warning, 0.86, level="warning")
+                fact_checks = []
 
         self.repository.set_chapters(job.id, chapters)
         self.repository.set_quotes(job.id, quotes)
@@ -505,22 +575,27 @@ class PipelineRunner:
                         eta_seconds=eta,
                     )
 
-                self.media.burn_ass_subtitles_with_progress(
-                    input_video,
-                    ass_path=ass_path,
-                    output_video=burned_video_path,
-                    duration_seconds=video_duration,
-                    container_format=selected_format,
-                    progress_callback=_burn_progress,
-                )
-                artifacts.append(
-                    make_artifact(
-                        name=burned_video_path.name,
-                        kind="video_burned",
-                        path=burned_video_path,
-                        mime_type=f"video/{selected_format if selected_format != 'mpegts' else 'mp2t'}",
+                try:
+                    self.media.burn_ass_subtitles_with_progress(
+                        input_video,
+                        ass_path=ass_path,
+                        output_video=burned_video_path,
+                        duration_seconds=video_duration,
+                        container_format=selected_format,
+                        progress_callback=_burn_progress,
                     )
-                )
+                    artifacts.append(
+                        make_artifact(
+                            name=burned_video_path.name,
+                            kind="video_burned",
+                            path=burned_video_path,
+                            mime_type=f"video/{selected_format if selected_format != 'mpegts' else 'mp2t'}",
+                        )
+                    )
+                except Exception as exc:
+                    warning = f"Burned subtitle export failed; continuing without burned video: {exc}"
+                    warnings.append(warning)
+                    self.repository.add_event(job.id, "burned_video", warning, 0.92, level="warning")
 
             if should_embed:
                 subtitle_source = srt_path if subtitle_codec in {"mov_text", "srt"} else ass_path
@@ -531,21 +606,26 @@ class PipelineRunner:
                     "Embedding soft subtitles",
                     eta_seconds=5.0,
                 )
-                self.media.embed_soft_subtitles(
-                    input_video=input_video,
-                    subtitle_path=subtitle_source,
-                    output_video=embedded_video_path,
-                    container_format=selected_format,
-                    subtitle_codec=subtitle_codec,
-                )
-                artifacts.append(
-                    make_artifact(
-                        name=embedded_video_path.name,
-                        kind="video_subtitled",
-                        path=embedded_video_path,
-                        mime_type=f"video/{selected_format if selected_format != 'mpegts' else 'mp2t'}",
+                try:
+                    self.media.embed_soft_subtitles(
+                        input_video=input_video,
+                        subtitle_path=subtitle_source,
+                        output_video=embedded_video_path,
+                        container_format=selected_format,
+                        subtitle_codec=subtitle_codec,
                     )
-                )
+                    artifacts.append(
+                        make_artifact(
+                            name=embedded_video_path.name,
+                            kind="video_subtitled",
+                            path=embedded_video_path,
+                            mime_type=f"video/{selected_format if selected_format != 'mpegts' else 'mp2t'}",
+                        )
+                    )
+                except Exception as exc:
+                    warning = f"Embedded subtitle export failed; sidecar subtitles are still available: {exc}"
+                    warnings.append(warning)
+                    self.repository.add_event(job.id, "burned_video", warning, 0.94, level="warning")
 
             if options.subtitle_embed_mode == "embedded" and not can_embed_subtitles:
                 self.repository.add_event(
@@ -582,55 +662,66 @@ class PipelineRunner:
                     eta_seconds=eta,
                 )
 
-            mask_result = self.mask_renderer.render(
-                input_video,
-                output_dir=mask_dir,
-                person_display_names={
-                    person.person_id: person.display_name or person.person_id
-                    for person in vision_result.people
-                },
-                progress_callback=_mask_progress,
-            )
-            artifacts.extend(
-                [
-                    make_artifact(
-                        name=mask_result.output_video_path.name,
-                        kind="video_masked",
-                        path=mask_result.output_video_path,
-                        mime_type="video/mp4",
-                    ),
-                    make_artifact(
-                        name=mask_result.metadata_path.name,
-                        kind="mask_metadata",
-                        path=mask_result.metadata_path,
-                        mime_type="application/json",
-                    ),
-                ]
-            )
-            self._stage_update(job.id, "mask_overlay", 1.0, "Mask overlay video ready")
+            try:
+                mask_result = self._get_mask_renderer().render(
+                    input_video,
+                    output_dir=mask_dir,
+                    person_display_names={
+                        person.person_id: person.display_name or person.person_id
+                        for person in vision_result.people
+                    },
+                    progress_callback=_mask_progress,
+                )
+                artifacts.extend(
+                    [
+                        make_artifact(
+                            name=mask_result.output_video_path.name,
+                            kind="video_masked",
+                            path=mask_result.output_video_path,
+                            mime_type="video/mp4",
+                        ),
+                        make_artifact(
+                            name=mask_result.metadata_path.name,
+                            kind="mask_metadata",
+                            path=mask_result.metadata_path,
+                            mime_type="application/json",
+                        ),
+                    ]
+                )
+                self._stage_update(job.id, "mask_overlay", 1.0, "Mask overlay video ready")
+            except Exception as exc:
+                warning = f"Mask overlay failed; continuing without masked video: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(job.id, "mask_overlay", warning, 0.99, level="warning")
+                self._stage_update(job.id, "mask_overlay", 1.0, "Mask overlay skipped due to error")
         else:
             self._stage_update(job.id, "mask_overlay", 1.0, "Mask overlay disabled")
 
         shorts_exports: list[ShortsExport] = []
         if options.generate_shorts:
             self.repository.add_event(job.id, "burned_video", "Generating 9:16 shorts", 0.97)
-            shorts_exports = self.shorts_generator.generate(
-                job_id=job.id,
-                input_video=input_video,
-                output_dir=shorts_dir,
-                preset=options.shorts_preset,
-                quotes=quotes,
-                chapters=chapters,
-            )
-            for short in shorts_exports:
-                artifacts.append(
-                    make_artifact(
-                        name=Path(short.path).name,
-                        kind="short_video",
-                        path=Path(short.path),
-                        mime_type="video/mp4",
-                    )
+            try:
+                shorts_exports = self.shorts_generator.generate(
+                    job_id=job.id,
+                    input_video=input_video,
+                    output_dir=shorts_dir,
+                    preset=options.shorts_preset,
+                    quotes=quotes,
+                    chapters=chapters,
                 )
+                for short in shorts_exports:
+                    artifacts.append(
+                        make_artifact(
+                            name=Path(short.path).name,
+                            kind="short_video",
+                            path=Path(short.path),
+                            mime_type="video/mp4",
+                        )
+                    )
+            except Exception as exc:
+                warning = f"Shorts generation failed; continuing without shorts: {exc}"
+                warnings.append(warning)
+                self.repository.add_event(job.id, "burned_video", warning, 0.98, level="warning")
         self.repository.set_shorts_exports(job.id, shorts_exports)
 
         self.repository.upsert_person_registry_from_people(job.id, vision_result.people)
@@ -639,15 +730,21 @@ class PipelineRunner:
         self.repository.set_artifacts(job.id, artifacts)
         self.repository.update_job_status(job.id, status="completed", progress=1.0, step="done")
         self._stage_update(job.id, "done", 1.0, "Completed successfully")
+        done_message = (
+            f"Completed successfully. OpenVINO device={vision_result.device_used}, "
+            f"speaker_method={attribution.method}, mask_overlay={should_render_mask_overlay}"
+        )
+        if warnings:
+            done_message = f"{done_message}. Completed with {len(warnings)} warning(s)."
         self.repository.add_event(
             job.id,
             "done",
-            (
-                f"Completed successfully. OpenVINO device={vision_result.device_used}, "
-                f"speaker_method={attribution.method}, mask_overlay={should_render_mask_overlay}"
-            ),
+            done_message,
             1.0,
         )
+        if warnings:
+            for item in warnings[-5:]:
+                self.repository.add_event(job.id, "done", item, 1.0, level="warning")
 
     def _extract_names_by_person(
         self, segments: list[TranscriptSegment]

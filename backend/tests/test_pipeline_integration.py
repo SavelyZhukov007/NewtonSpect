@@ -15,6 +15,7 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
     options = JobOptions(
         export_formats=["srt", "vtt", "ass", "mp4_burned"],
         subtitle_embed_mode="burned",
+        enable_active_speaker_model=False,
     )
     container.repository.create_job(
         job_id="job-e2e",
@@ -87,11 +88,17 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
         output_video.write_bytes(b"fake mp4")
         return output_video
 
+    class _FakePeopleAnalyzer:
+        analyze = staticmethod(fake_analyze)
+
+    class _FakeReportGenerator:
+        generate = staticmethod(fake_report)
+
     monkeypatch.setattr(pipeline.media, "extract_audio_wav", fake_extract)
     monkeypatch.setattr(pipeline.asr, "transcribe", fake_transcribe)
-    monkeypatch.setattr(pipeline.people_analyzer, "analyze", fake_analyze)
-    monkeypatch.setattr(pipeline.report_generator, "generate", fake_report)
     monkeypatch.setattr(pipeline.media, "burn_ass_subtitles_with_progress", fake_burn)
+    pipeline.people_analyzer = _FakePeopleAnalyzer()
+    pipeline.report_generator = _FakeReportGenerator()
 
     pipeline.process(job)
 
@@ -108,3 +115,59 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
     people = container.repository.decode_people(final_job.people_json)
     assert people[0].person_id == "P001"
     assert people[0].key_comments
+
+
+def test_pipeline_keeps_subtitles_when_burn_stage_fails(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NEWTONSPECT_STORAGE_ROOT", str(tmp_path / "storage"))
+    monkeypatch.setenv("NEWTONSPECT_DB_PATH", str(tmp_path / "storage" / "db.sqlite3"))
+    container = build_container()
+
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(b"fake video")
+    options = JobOptions(
+        export_formats=["srt", "vtt", "ass", "mp4_burned"],
+        subtitle_embed_mode="burned",
+        detect_people=False,
+        generate_summary=False,
+    )
+    container.repository.create_job(
+        job_id="job-burn-fail",
+        original_filename="demo.mp4",
+        input_video_path=str(video_path),
+        options=options,
+        created_by_device="Windows",
+        locale="en",
+    )
+    job = container.repository.get_job("job-burn-fail")
+    assert job is not None
+
+    pipeline = container.build_pipeline()
+
+    def fake_extract(_video: Path, output_wav: Path) -> Path:
+        output_wav.write_bytes(b"RIFFfake")
+        return output_wav
+
+    def fake_transcribe(**_kwargs):
+        return [
+            TranscriptSegment(start=0.0, end=2.0, text="Hello world", confidence=0.9),
+            TranscriptSegment(start=2.1, end=3.8, text="Second phrase", confidence=0.8),
+        ]
+
+    def fake_burn(*args, **kwargs):
+        _ = (args, kwargs)
+        raise RuntimeError("forced burn failure")
+
+    monkeypatch.setattr(pipeline.media, "extract_audio_wav", fake_extract)
+    monkeypatch.setattr(pipeline.asr, "transcribe", fake_transcribe)
+    monkeypatch.setattr(pipeline.media, "burn_ass_subtitles_with_progress", fake_burn)
+
+    pipeline.process(job)
+
+    final_job = container.repository.get_job("job-burn-fail")
+    assert final_job is not None
+    assert final_job.status == "completed"
+    artifacts = container.repository.decode_artifacts(final_job.artifacts_json)
+    kinds = {item.kind for item in artifacts}
+    assert "subtitle_srt" in kinds
+    assert "subtitle_vtt" in kinds
+    assert "subtitle_ass" in kinds
