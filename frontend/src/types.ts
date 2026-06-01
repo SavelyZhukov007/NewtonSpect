@@ -23,6 +23,16 @@ export interface JobOptions {
   output_video_format: string
   subtitle_embed_mode: 'auto' | 'embedded' | 'sidecar' | 'burned'
   subtitle_style: Record<string, unknown>
+  generate_shorts: boolean
+  shorts_preset: Record<string, unknown>
+  privacy_mode: 'auto_risk' | 'enabled' | 'disabled'
+  translate_languages: string[]
+  enable_fact_check: boolean
+  enable_chapters: boolean
+  enable_quotes: boolean
+  enable_quality_score: boolean
+  platform_presets: string[]
+  enable_live_draft: boolean
 }
 
 export interface StageRuntime {
@@ -91,6 +101,118 @@ export interface VideoReport {
   key_topics: string[]
   people_highlights: Record<string, string[]>
   raw_markdown: string
+}
+
+export interface Chapter {
+  chapter_id: string
+  title: string
+  start: number
+  end: number
+  confidence: number
+}
+
+export interface KeyQuote {
+  quote_id: string
+  start: number
+  end: number
+  text: string
+  score: number
+  speaker_ref: string | null
+}
+
+export interface SpeakerTimelineItem {
+  speaker_ref: string
+  start: number
+  end: number
+  duration: number
+}
+
+export interface QualityScore {
+  overall: number
+  asr_confidence: number
+  subtitle_coverage: number
+  speaker_stability: number
+  people_stability: number
+  report_completeness: number
+  notes: string[]
+  speaker_timeline: SpeakerTimelineItem[]
+}
+
+export interface RunComparison {
+  current_job_id: string
+  previous_job_id: string | null
+  wer_like_delta: number
+  people_delta: number
+  subtitle_coverage_delta: number
+  speaker_stability_delta: number
+  duration_speech_delta: number
+  summary_md: string
+}
+
+export interface SubtitleRevision {
+  revision_id: number
+  job_id: string
+  editor_device: string
+  note: string
+  created_at: string
+}
+
+export interface TranslationTrack {
+  language: string
+  segments: TranscriptSegment[]
+}
+
+export interface TranscriptSegment {
+  id?: string | null
+  start: number
+  end: number
+  text: string
+  confidence: number
+  speaker_ref: string | null
+}
+
+export interface GlossaryTerm {
+  term_id: string
+  source: string
+  target: string
+  locale: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PersonRegistryEntry {
+  registry_id: string
+  display_name: string
+  aliases: string[]
+  portrait_path: string | null
+  linked_job_ids: string[]
+  confidence: number
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeBaseStatus {
+  documents: number
+  chunks: number
+  indexed_at: string | null
+  kb_root: string
+}
+
+export interface FactCheckItem {
+  claim: string
+  status: 'supported' | 'contradicted' | 'not_found'
+  reason: string
+  evidence_refs: string[]
+}
+
+export interface ShortsExport {
+  short_id: string
+  job_id: string
+  label: string
+  path: string
+  start: number
+  end: number
+  created_at: string
 }
 
 export interface JobLibraryResponse {

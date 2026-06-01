@@ -1,9 +1,21 @@
 import type {
   Artifact,
+  Chapter,
+  FactCheckItem,
   FormatCapabilitiesResponse,
+  GlossaryTerm,
   JobLibraryResponse,
   JobView,
+  KnowledgeBaseStatus,
+  KeyQuote,
   PersonProfile,
+  PersonRegistryEntry,
+  QualityScore,
+  RunComparison,
+  ShortsExport,
+  SubtitleRevision,
+  TranscriptSegment,
+  TranslationTrack,
   VideoReport
 } from './types'
 
@@ -62,6 +74,16 @@ export async function createJob(params: {
   subtitleEmbedMode: 'auto' | 'embedded' | 'sidecar' | 'burned'
   subtitleStyle: Record<string, unknown>
   exportFormats: string[]
+  generateShorts: boolean
+  shortsPreset: Record<string, unknown>
+  privacyMode: 'auto_risk' | 'enabled' | 'disabled'
+  translateLanguages: string[]
+  enableFactCheck: boolean
+  enableChapters: boolean
+  enableQuotes: boolean
+  enableQualityScore: boolean
+  platformPresets: string[]
+  enableLiveDraft: boolean
 }): Promise<JobView> {
   const formData = new FormData()
   formData.append('video', params.file)
@@ -83,6 +105,16 @@ export async function createJob(params: {
   formData.append('subtitle_embed_mode', params.subtitleEmbedMode)
   formData.append('subtitle_style_json', JSON.stringify(params.subtitleStyle))
   formData.append('export_formats', params.exportFormats.join(','))
+  formData.append('generate_shorts', String(params.generateShorts))
+  formData.append('shorts_preset_json', JSON.stringify(params.shortsPreset))
+  formData.append('privacy_mode', params.privacyMode)
+  formData.append('translate_languages', params.translateLanguages.join(','))
+  formData.append('enable_fact_check', String(params.enableFactCheck))
+  formData.append('enable_chapters', String(params.enableChapters))
+  formData.append('enable_quotes', String(params.enableQuotes))
+  formData.append('enable_quality_score', String(params.enableQualityScore))
+  formData.append('platform_presets', params.platformPresets.join(','))
+  formData.append('enable_live_draft', String(params.enableLiveDraft))
 
   const response = await fetch(`${API_BASE}/api/v1/jobs`, {
     method: 'POST',
@@ -113,6 +145,16 @@ export async function createJobChunked(params: {
   subtitleEmbedMode: 'auto' | 'embedded' | 'sidecar' | 'burned'
   subtitleStyle: Record<string, unknown>
   exportFormats: string[]
+  generateShorts: boolean
+  shortsPreset: Record<string, unknown>
+  privacyMode: 'auto_risk' | 'enabled' | 'disabled'
+  translateLanguages: string[]
+  enableFactCheck: boolean
+  enableChapters: boolean
+  enableQuotes: boolean
+  enableQualityScore: boolean
+  platformPresets: string[]
+  enableLiveDraft: boolean
   onProgress?: (progress: UploadProgress) => void
   chunkSize?: number
 }): Promise<JobView> {
@@ -211,7 +253,17 @@ export async function createJobChunked(params: {
                 show_face_mask_preview: params.showFaceMaskPreview,
                 output_video_format: params.outputVideoFormat,
                 subtitle_embed_mode: params.subtitleEmbedMode,
-                subtitle_style: params.subtitleStyle
+                subtitle_style: params.subtitleStyle,
+                generate_shorts: params.generateShorts,
+                shorts_preset: params.shortsPreset,
+                privacy_mode: params.privacyMode,
+                translate_languages: params.translateLanguages,
+                enable_fact_check: params.enableFactCheck,
+                enable_chapters: params.enableChapters,
+                enable_quotes: params.enableQuotes,
+                enable_quality_score: params.enableQualityScore,
+                platform_presets: params.platformPresets,
+                enable_live_draft: params.enableLiveDraft
               }
             })
           )
@@ -294,6 +346,195 @@ export async function requestExportBundle(jobId: string, formats: string[]): Pro
   assertOk(response, 'Failed to create export bundle')
   const payload = await response.json()
   return payload.artifacts as Artifact[]
+}
+
+export async function fetchChapters(jobId: string): Promise<Chapter[]> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/chapters`)
+  assertOk(response, 'Failed to fetch chapters')
+  const payload = await response.json()
+  return payload.chapters as Chapter[]
+}
+
+export async function fetchQuotes(jobId: string): Promise<KeyQuote[]> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/quotes`)
+  assertOk(response, 'Failed to fetch quotes')
+  const payload = await response.json()
+  return payload.quotes as KeyQuote[]
+}
+
+export async function fetchQuality(jobId: string): Promise<QualityScore> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/quality`)
+  assertOk(response, 'Failed to fetch quality')
+  const payload = await response.json()
+  return payload.quality as QualityScore
+}
+
+export async function fetchComparison(jobId: string): Promise<RunComparison> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/comparison`)
+  assertOk(response, 'Failed to fetch comparison')
+  const payload = await response.json()
+  return payload.comparison as RunComparison
+}
+
+export async function fetchSubtitles(jobId: string): Promise<{
+  segments: TranscriptSegment[]
+  revisions: SubtitleRevision[]
+}> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/subtitles`)
+  assertOk(response, 'Failed to fetch subtitles')
+  const payload = await response.json()
+  return {
+    segments: payload.segments as TranscriptSegment[],
+    revisions: payload.revisions as SubtitleRevision[]
+  }
+}
+
+export async function updateSubtitles(
+  jobId: string,
+  segments: TranscriptSegment[],
+  note: string
+): Promise<{ segments: TranscriptSegment[]; revisions: SubtitleRevision[] }> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/subtitles`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ segments, note })
+  })
+  assertOk(response, 'Failed to update subtitles')
+  const payload = await response.json()
+  return {
+    segments: payload.segments as TranscriptSegment[],
+    revisions: payload.revisions as SubtitleRevision[]
+  }
+}
+
+export async function fetchTranslations(jobId: string): Promise<TranslationTrack[]> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/translations`)
+  assertOk(response, 'Failed to fetch translations')
+  const payload = await response.json()
+  return payload.tracks as TranslationTrack[]
+}
+
+export async function fetchFactCheck(jobId: string): Promise<FactCheckItem[]> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/fact-check`)
+  assertOk(response, 'Failed to fetch fact-check')
+  const payload = await response.json()
+  return payload.items as FactCheckItem[]
+}
+
+export async function buildShorts(
+  jobId: string,
+  clipCount: number,
+  clipDurationSeconds: number
+): Promise<ShortsExport[]> {
+  const response = await fetch(`${API_BASE}/api/v1/jobs/${jobId}/shorts`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      clip_count: clipCount,
+      clip_duration_seconds: clipDurationSeconds
+    })
+  })
+  assertOk(response, 'Failed to generate shorts')
+  const payload = await response.json()
+  return payload.shorts as ShortsExport[]
+}
+
+export async function listGlossary(): Promise<GlossaryTerm[]> {
+  const response = await fetch(`${API_BASE}/api/v1/glossary`)
+  assertOk(response, 'Failed to fetch glossary')
+  const payload = await response.json()
+  return payload.items as GlossaryTerm[]
+}
+
+export async function upsertGlossary(params: {
+  source: string
+  target: string
+  locale: string
+}): Promise<GlossaryTerm[]> {
+  const response = await fetch(`${API_BASE}/api/v1/glossary`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(params)
+  })
+  assertOk(response, 'Failed to upsert glossary term')
+  const payload = await response.json()
+  return payload.items as GlossaryTerm[]
+}
+
+export async function deleteGlossary(termId: string): Promise<GlossaryTerm[]> {
+  const response = await fetch(`${API_BASE}/api/v1/glossary/${encodeURIComponent(termId)}`, {
+    method: 'DELETE'
+  })
+  assertOk(response, 'Failed to delete glossary term')
+  const payload = await response.json()
+  return payload.items as GlossaryTerm[]
+}
+
+export async function fetchPersonRegistry(): Promise<PersonRegistryEntry[]> {
+  const response = await fetch(`${API_BASE}/api/v1/person-registry`)
+  assertOk(response, 'Failed to fetch person registry')
+  const payload = await response.json()
+  return payload.items as PersonRegistryEntry[]
+}
+
+export async function mergePersonRegistry(
+  sourceRegistryId: string,
+  targetRegistryId: string
+): Promise<PersonRegistryEntry[]> {
+  const response = await fetch(`${API_BASE}/api/v1/person-registry/merge`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      source_registry_id: sourceRegistryId,
+      target_registry_id: targetRegistryId
+    })
+  })
+  assertOk(response, 'Failed to merge person registry')
+  const payload = await response.json()
+  return payload.items as PersonRegistryEntry[]
+}
+
+export async function splitPersonRegistry(
+  registryId: string,
+  aliasToSplit: string
+): Promise<PersonRegistryEntry[]> {
+  const response = await fetch(`${API_BASE}/api/v1/person-registry/split`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      registry_id: registryId,
+      alias_to_split: aliasToSplit
+    })
+  })
+  assertOk(response, 'Failed to split person registry')
+  const payload = await response.json()
+  return payload.items as PersonRegistryEntry[]
+}
+
+export async function fetchKnowledgeBaseStatus(): Promise<KnowledgeBaseStatus> {
+  const response = await fetch(`${API_BASE}/api/v1/kb/status`)
+  assertOk(response, 'Failed to fetch KB status')
+  const payload = await response.json()
+  return payload.status as KnowledgeBaseStatus
+}
+
+export async function reindexKnowledgeBase(): Promise<KnowledgeBaseStatus> {
+  const response = await fetch(`${API_BASE}/api/v1/kb/reindex`, {
+    method: 'POST'
+  })
+  assertOk(response, 'Failed to reindex KB')
+  const payload = await response.json()
+  return payload.status as KnowledgeBaseStatus
 }
 
 export function artifactDownloadUrl(jobId: string, artifactName: string): string {

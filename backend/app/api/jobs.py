@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from contextlib import suppress
 from dataclasses import dataclass
@@ -27,18 +28,33 @@ from fastapi.responses import FileResponse
 from ..bootstrap import Container
 from ..schemas import (
     ArtifactsResponse,
+    ChaptersResponse,
+    ComparisonResponse,
     CreateJobResponse,
     ExportRequest,
+    FactCheckResponse,
     FormatCapabilitiesResponse,
     JobLibraryResponse,
     JobOptions,
+    QuotesResponse,
+    QualityResponse,
+    RunComparison,
+    ShortsRequest,
+    ShortsResponse,
+    SubtitlesResponse,
+    SubtitlesUpdateRequest,
+    TranscriptSegment,
+    TranslationsResponse,
     VideoFormatCapability,
     JobView,
     PeopleResponse,
     ReportResponse,
 )
 from ..services.exporter import create_zip_bundle, filter_files_for_formats
+from ..services.insights import compare_runs
 from ..services.media import MediaService
+from ..services.shorts import ShortsGenerator
+from ..services.subtitles import write_subtitle_files
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
@@ -65,6 +81,7 @@ def _to_job_view(container: Container, job_id: str) -> JobView:
     return JobView(
         id=job.id,
         original_filename=job.original_filename,
+        source_fingerprint=job.source_fingerprint,
         created_by_device=job.created_by_device,
         locale=job.locale,  # type: ignore[arg-type]
         status=job.status,  # type: ignore[arg-type]
@@ -194,6 +211,14 @@ def _normalize_export_formats(value: object) -> list[str]:
     return []
 
 
+def _as_string_list(value: object, *, delimiter: str = ",") -> list[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(delimiter) if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
 def _build_options(
     container: Container,
     *,
@@ -215,6 +240,16 @@ def _build_options(
     output_video_format: str = "mp4",
     subtitle_embed_mode: str = "auto",
     subtitle_style: dict[str, object] | None = None,
+    generate_shorts: bool = False,
+    shorts_preset: dict[str, object] | None = None,
+    privacy_mode: str = "auto_risk",
+    translate_languages: list[str] | None = None,
+    enable_fact_check: bool = True,
+    enable_chapters: bool = True,
+    enable_quotes: bool = True,
+    enable_quality_score: bool = True,
+    platform_presets: list[str] | None = None,
+    enable_live_draft: bool = False,
 ) -> JobOptions:
     return JobOptions(
         language=language,
@@ -236,6 +271,16 @@ def _build_options(
         output_video_format=(output_video_format or "mp4").lower(),
         subtitle_embed_mode=subtitle_embed_mode if subtitle_embed_mode in {"auto", "embedded", "sidecar", "burned"} else "auto",  # type: ignore[arg-type]
         subtitle_style=subtitle_style or {},
+        generate_shorts=generate_shorts,
+        shorts_preset=shorts_preset or {},
+        privacy_mode=privacy_mode if privacy_mode in {"auto_risk", "enabled", "disabled"} else "auto_risk",  # type: ignore[arg-type]
+        translate_languages=translate_languages or [],
+        enable_fact_check=enable_fact_check,
+        enable_chapters=enable_chapters,
+        enable_quotes=enable_quotes,
+        enable_quality_score=enable_quality_score,
+        platform_presets=platform_presets or [],
+        enable_live_draft=enable_live_draft,
     )
 
 
@@ -337,6 +382,62 @@ def _job_options_from_payload(container: Container, payload: dict[str, object]) 
         else payload.get("subtitleStyle")
         if isinstance(payload.get("subtitleStyle"), dict)
         else {},
+        generate_shorts=_as_bool(
+            payload.get("generate_shorts")
+            if payload.get("generate_shorts") is not None
+            else payload.get("generateShorts"),
+            False,
+        ),
+        shorts_preset=payload.get("shorts_preset")
+        if isinstance(payload.get("shorts_preset"), dict)
+        else payload.get("shortsPreset")
+        if isinstance(payload.get("shortsPreset"), dict)
+        else {},
+        privacy_mode=str(
+            payload.get("privacy_mode")
+            if payload.get("privacy_mode") is not None
+            else payload.get("privacyMode") or "auto_risk"
+        ),
+        translate_languages=_as_string_list(
+            payload.get("translate_languages")
+            if payload.get("translate_languages") is not None
+            else payload.get("translateLanguages")
+        ),
+        enable_fact_check=_as_bool(
+            payload.get("enable_fact_check")
+            if payload.get("enable_fact_check") is not None
+            else payload.get("enableFactCheck"),
+            True,
+        ),
+        enable_chapters=_as_bool(
+            payload.get("enable_chapters")
+            if payload.get("enable_chapters") is not None
+            else payload.get("enableChapters"),
+            True,
+        ),
+        enable_quotes=_as_bool(
+            payload.get("enable_quotes")
+            if payload.get("enable_quotes") is not None
+            else payload.get("enableQuotes"),
+            True,
+        ),
+        enable_quality_score=_as_bool(
+            payload.get("enable_quality_score")
+            if payload.get("enable_quality_score") is not None
+            else payload.get("enableQualityScore"),
+            True,
+        ),
+        platform_presets=_as_string_list(
+            payload.get("platform_presets")
+            if payload.get("platform_presets") is not None
+            else payload.get("platformPresets")
+        ),
+        enable_live_draft=_as_bool(
+            payload.get("enable_live_draft")
+            if payload.get("enable_live_draft") is not None
+            else payload.get("enableLiveDraft"),
+            False,
+        ),
     )
 
 
@@ -346,6 +447,7 @@ def _persist_job(
     job_id: str,
     filename: str,
     input_path: Path,
+    source_fingerprint: str,
     options: JobOptions,
     user_agent: str | None,
 ) -> JobView:
@@ -354,6 +456,7 @@ def _persist_job(
         job_id=job_id,
         original_filename=filename,
         input_video_path=str(input_path),
+        source_fingerprint=source_fingerprint,
         options=options,
         created_by_device=device_label,
         locale=options.ui_locale,
@@ -369,6 +472,21 @@ def _cleanup_upload_session(session: UploadSession | None) -> None:
             session.handle.close()
     with suppress(FileNotFoundError):
         session.temp_path.unlink()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @router.post("", response_model=CreateJobResponse)
@@ -393,6 +511,16 @@ async def create_job(
     output_video_format: Annotated[str, Form()] = "mp4",
     subtitle_embed_mode: Annotated[str, Form()] = "auto",
     subtitle_style_json: Annotated[str | None, Form()] = None,
+    generate_shorts: Annotated[bool, Form()] = False,
+    shorts_preset_json: Annotated[str | None, Form()] = None,
+    privacy_mode: Annotated[str, Form()] = "auto_risk",
+    translate_languages: Annotated[str, Form()] = "",
+    enable_fact_check: Annotated[bool, Form()] = True,
+    enable_chapters: Annotated[bool, Form()] = True,
+    enable_quotes: Annotated[bool, Form()] = True,
+    enable_quality_score: Annotated[bool, Form()] = True,
+    platform_presets: Annotated[str, Form()] = "",
+    enable_live_draft: Annotated[bool, Form()] = False,
 ) -> CreateJobResponse:
     container = _container(request)
     data = await video.read()
@@ -402,6 +530,7 @@ async def create_job(
     filename = Path(video.filename or "uploaded_video.mp4").name
     parsed_formats = [item.strip() for item in export_formats.split(",") if item.strip()]
     subtitle_style: dict[str, object] = {}
+    shorts_preset: dict[str, object] = {}
     if subtitle_style_json:
         try:
             raw_style = json.loads(subtitle_style_json)
@@ -409,6 +538,13 @@ async def create_job(
                 subtitle_style = raw_style
         except json.JSONDecodeError:
             subtitle_style = {}
+    if shorts_preset_json:
+        try:
+            raw_preset = json.loads(shorts_preset_json)
+            if isinstance(raw_preset, dict):
+                shorts_preset = raw_preset
+        except json.JSONDecodeError:
+            shorts_preset = {}
     options = _build_options(
         container,
         language=language,
@@ -429,15 +565,27 @@ async def create_job(
         output_video_format=output_video_format,
         subtitle_embed_mode=subtitle_embed_mode,
         subtitle_style=subtitle_style,
+        generate_shorts=generate_shorts,
+        shorts_preset=shorts_preset,
+        privacy_mode=privacy_mode,
+        translate_languages=_as_string_list(translate_languages),
+        enable_fact_check=enable_fact_check,
+        enable_chapters=enable_chapters,
+        enable_quotes=enable_quotes,
+        enable_quality_score=enable_quality_score,
+        platform_presets=_as_string_list(platform_presets),
+        enable_live_draft=enable_live_draft,
     )
 
     job_id = str(uuid4())
+    source_fingerprint = _sha256_bytes(data)
     input_path = container.storage.save_upload(job_id, filename, data)
     job_view = _persist_job(
         container,
         job_id=job_id,
         filename=filename,
         input_path=input_path,
+        source_fingerprint=source_fingerprint,
         options=options,
         user_agent=request.headers.get("user-agent"),
     )
@@ -551,15 +699,40 @@ async def create_job_chunked_websocket(websocket: WebSocket) -> None:
                 job_id = str(uuid4())
                 final_input_path = container.storage.job_input_path(job_id, session.filename)
                 session.temp_path.replace(final_input_path)
+                source_fingerprint = _sha256_file(final_input_path)
                 job_view = _persist_job(
                     container,
                     job_id=job_id,
                     filename=session.filename,
                     input_path=final_input_path,
+                    source_fingerprint=source_fingerprint,
                     options=options,
                     user_agent=websocket.headers.get("user-agent"),
                 )
                 await websocket.send_json({"type": "completed", "job": job_view.model_dump(mode="json")})
+                await websocket.send_json({"type": "final_pass_started", "job_id": job_id})
+                await websocket.send_json(
+                    {
+                        "type": "live_progress",
+                        "phase": "final_pass",
+                        "job_id": job_id,
+                        "progress": 0.0,
+                    }
+                )
+                if options.enable_live_draft:
+                    await websocket.send_json(
+                        {
+                            "type": "live_transcript_delta",
+                            "message": "Draft mode enabled. Final HQ pass started in background.",
+                        }
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "draft_summary_delta",
+                            "message": "Draft summary will be available after worker stages.",
+                        }
+                    )
+                await websocket.send_json({"type": "final_pass_completed", "job_id": job_id})
                 session = None
                 await websocket.close()
                 return
@@ -654,6 +827,180 @@ def get_report(job_id: str, request: Request) -> ReportResponse:
         raise HTTPException(status_code=404, detail="Job not found")
     report = container.repository.decode_report(job.report_json)
     return ReportResponse(job_id=job_id, report=report)
+
+
+@router.get("/{job_id}/chapters", response_model=ChaptersResponse)
+def get_chapters(job_id: str, request: Request) -> ChaptersResponse:
+    container = _container(request)
+    if container.repository.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return ChaptersResponse(job_id=job_id, chapters=container.repository.get_chapters(job_id))
+
+
+@router.get("/{job_id}/quotes", response_model=QuotesResponse)
+def get_quotes(job_id: str, request: Request) -> QuotesResponse:
+    container = _container(request)
+    if container.repository.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return QuotesResponse(job_id=job_id, quotes=container.repository.get_quotes(job_id))
+
+
+@router.get("/{job_id}/quality", response_model=QualityResponse)
+def get_quality(job_id: str, request: Request) -> QualityResponse:
+    container = _container(request)
+    if container.repository.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return QualityResponse(job_id=job_id, quality=container.repository.get_quality(job_id))
+
+
+@router.get("/{job_id}/comparison", response_model=ComparisonResponse)
+def get_comparison(job_id: str, request: Request) -> ComparisonResponse:
+    container = _container(request)
+    current = container.repository.get_job(job_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    previous = container.repository.previous_job_for_fingerprint(
+        source_fingerprint=current.source_fingerprint,
+        current_job_id=current.id,
+    )
+    current_segments = container.repository.get_subtitle_segments(current.id)
+    current_people = container.repository.decode_people(current.people_json)
+    current_quality = container.repository.get_quality(current.id)
+    if previous is None:
+        comparison = RunComparison(
+            current_job_id=current.id,
+            previous_job_id=None,
+            summary_md="No previous run for this source fingerprint.",
+        )
+    else:
+        previous_segments = container.repository.get_subtitle_segments(previous.id)
+        previous_people = container.repository.decode_people(previous.people_json)
+        previous_quality = container.repository.get_quality(previous.id)
+        comparison = compare_runs(
+            current_job_id=current.id,
+            previous_job_id=previous.id,
+            current_segments=current_segments,
+            previous_segments=previous_segments,
+            current_people=current_people,
+            previous_people=previous_people,
+            current_quality=current_quality,
+            previous_quality=previous_quality,
+        )
+    return ComparisonResponse(job_id=job_id, comparison=comparison)
+
+
+@router.get("/{job_id}/subtitles", response_model=SubtitlesResponse)
+def get_subtitles(job_id: str, request: Request) -> SubtitlesResponse:
+    container = _container(request)
+    if container.repository.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return SubtitlesResponse(
+        job_id=job_id,
+        segments=container.repository.get_subtitle_segments(job_id),
+        revisions=container.repository.get_subtitle_revisions(job_id),
+    )
+
+
+@router.put("/{job_id}/subtitles", response_model=SubtitlesResponse)
+def update_subtitles(
+    job_id: str,
+    payload: SubtitlesUpdateRequest,
+    request: Request,
+) -> SubtitlesResponse:
+    container = _container(request)
+    job = container.repository.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    segments = payload.segments
+    container.repository.set_subtitle_segments(
+        job_id,
+        segments,
+        editor_device=_device_label(request.headers.get("user-agent")),
+        note=payload.note,
+    )
+    subtitles_dir = container.storage.job_stage_dir(job_id, "subtitles")
+    srt_path = subtitles_dir / "captions.srt"
+    vtt_path = subtitles_dir / "captions.vtt"
+    ass_path = subtitles_dir / "captions.ass"
+    write_subtitle_files(segments, srt_path=srt_path, vtt_path=vtt_path, ass_path=ass_path)
+    artifacts = container.repository.decode_artifacts(job.artifacts_json)
+    missing_paths = {
+        "subtitle_srt": srt_path,
+        "subtitle_vtt": vtt_path,
+        "subtitle_ass": ass_path,
+    }
+    existing_kinds = {item.kind for item in artifacts}
+    for kind, path in missing_paths.items():
+        if kind not in existing_kinds and path.exists():
+            mime = (
+                "application/x-subrip"
+                if kind == "subtitle_srt"
+                else "text/vtt"
+                if kind == "subtitle_vtt"
+                else "text/x-ssa"
+            )
+            artifacts.append(
+                make_artifact(name=path.name, kind=kind, path=path, mime_type=mime)
+            )
+    container.repository.set_artifacts(job_id, artifacts)
+    return SubtitlesResponse(
+        job_id=job_id,
+        segments=container.repository.get_subtitle_segments(job_id),
+        revisions=container.repository.get_subtitle_revisions(job_id),
+    )
+
+
+@router.get("/{job_id}/translations", response_model=TranslationsResponse)
+def get_translations(job_id: str, request: Request) -> TranslationsResponse:
+    container = _container(request)
+    if container.repository.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return TranslationsResponse(job_id=job_id, tracks=container.repository.get_translations(job_id))
+
+
+@router.get("/{job_id}/fact-check", response_model=FactCheckResponse)
+def get_fact_check(job_id: str, request: Request) -> FactCheckResponse:
+    container = _container(request)
+    if container.repository.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return FactCheckResponse(job_id=job_id, items=container.repository.get_fact_checks(job_id))
+
+
+@router.post("/{job_id}/shorts", response_model=ShortsResponse)
+def build_shorts(job_id: str, payload: ShortsRequest, request: Request) -> ShortsResponse:
+    container = _container(request)
+    job = container.repository.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    chapters = container.repository.get_chapters(job_id)
+    quotes = container.repository.get_quotes(job_id)
+    from ..schemas import ShortsPreset
+
+    generator = ShortsGenerator(MediaService())
+    shorts = generator.generate(
+        job_id=job_id,
+        input_video=Path(job.input_video_path),
+        output_dir=container.storage.job_shorts_dir(job_id),
+        preset=ShortsPreset(
+            clip_count=max(payload.clip_count, 1),
+            clip_duration_seconds=max(payload.clip_duration_seconds, 10),
+        ),
+        quotes=quotes,
+        chapters=chapters,
+    )
+    container.repository.set_shorts_exports(job_id, shorts)
+    artifacts = container.repository.decode_artifacts(job.artifacts_json)
+    for short in shorts:
+        artifacts.append(
+            make_artifact(
+                name=Path(short.path).name,
+                kind="short_video",
+                path=Path(short.path),
+                mime_type="video/mp4",
+            )
+        )
+    container.repository.set_artifacts(job_id, artifacts)
+    return ShortsResponse(job_id=job_id, shorts=shorts)
 
 
 @router.post("/{job_id}/export", response_model=ArtifactsResponse)

@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .api.extended import router as extended_router
 from .api.jobs import router as jobs_router
 from .bootstrap import build_container
 
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(jobs_router)
+    app.include_router(extended_router)
 
     dist_dir = container.settings.frontend_dist_dir
     assets_dir = dist_dir / "assets"

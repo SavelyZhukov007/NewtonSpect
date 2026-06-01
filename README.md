@@ -1,51 +1,58 @@
-﻿# AstraOrpheus
+# AstraOrpheus V3 (Local-Only)
 
-AstraOrpheus is a local `frontend + backend + worker` platform for automatic subtitles, people analytics, and AI video summaries.
+AstraOrpheus is a local-first `frontend + backend + worker` platform for:
 
-## Core stack
+- automatic subtitles (Whisper `large-v3`)
+- people/face analytics (OpenVINO)
+- AI summaries and structured reports (Ollama `qwen2.5:3b`)
+- editable subtitle workflow with artifact exports
 
-- ASR: `faster-whisper` + `openai/whisper-large-v3`
-- Vision: OpenVINO (person/face/landmarks/re-id, with `MYRIAD -> CPU` fallback)
-- Summary: local Ollama `qwen2.5:3b`
-- Queue/storage: SQLite + filesystem artifacts
-- UI: React + TypeScript (mobile-friendly, RU/EN)
+No cloud dependency is required for core flow.
 
-## What is implemented now
+## Stack
 
-- Chunked video upload over WebSocket with live upload telemetry (speed, ETA, bytes)
-- Real runtime stage telemetry from backend pipeline:
-  - per-stage progress
-  - stage message
-  - stage speed + unit
-  - stage ETA
-- Camera studio mode:
-  - round preview
-  - face-mask preview toggle
-  - recording hints
-  - streaming chunk upload to backend via WebSocket
-  - auto-stop support
-- Result tabs:
-  - `Subtitles`
-  - `Video Export`
-  - `People`
-  - `AI Summary`
-  - `Storage`
-- Custom player with subtitle overlay styling (size/color/outline/position)
-- Reliable artifact downloads (`fetch -> blob`) + share flow for mobile/iPhone
-- ZIP bundle export endpoint and UI action
-- Device fingerprint in job author: `device / OS (browser)`
+- Backend: FastAPI + SQLite + filesystem artifacts
+- Worker: Python background polling worker
+- Frontend: React + Vite + TypeScript (mobile-friendly)
+- ASR: `faster-whisper` (`openai/whisper-large-v3`)
+- Vision: OpenVINO (`MYRIAD -> CPU` fallback)
+- LLM: local Ollama (`qwen2.5:3b`)
 
-## Pipeline stages
+## V3 Highlights
+
+- Run comparison by `source_fingerprint` (SHA256): current run vs previous run of the same source
+- Subtitle editor with persisted segment revisions
+- Chapters + key quotes generation
+- Quality score (`ASR confidence`, subtitle coverage, speaker stability, people stability, report completeness)
+- Translation tracks (`EN/ES/DE/FR`) with local fallback
+- Offline KB reindex + local fact-check (`supported / contradicted / not_found`)
+- Global person registry across jobs (merge/split operations)
+- Privacy mode (`auto_risk | enabled | disabled`) with subtitle redaction path
+- Optional 9:16 shorts generation
+- Extended UI tabs: `Chapters`, `Quotes`, `Compare`, `Quality`, `Glossary`, `Knowledge Base`
+- Camera studio + chunked WebSocket upload + dual-pass events
+- Reliable desktop/mobile artifact download (including iPhone share flow)
+
+## Pipeline
 
 `ingest -> audio_extract -> asr -> subtitle_postprocess -> vision -> speaker_attribution -> report -> burned_video -> mask_overlay -> done`
 
-## Project layout
+V3 post-processing adds:
 
-- `backend/` - FastAPI API + pipeline + repository
-- `backend/worker.py` - background worker loop
-- `frontend/` - React + Vite app
-- `storage/` - DB, uploads, artifacts
-- `build.py` - single entrypoint for setup/check/build/run/force
+- chapters / quotes / quality
+- translations
+- offline fact-check
+- optional shorts exports
+- global person-registry updates
+
+## Project Layout
+
+- `backend/` - FastAPI API, queue repository, pipeline services
+- `backend/worker.py` - background worker
+- `frontend/` - React UI
+- `storage/` - DB + artifacts
+- `storage/kb` - global offline KB source directory
+- `build.py` - unified setup/check/build/run/force entrypoint
 
 ## Requirements
 
@@ -53,9 +60,9 @@ AstraOrpheus is a local `frontend + backend + worker` platform for automatic sub
 - Node.js `20+`
 - `ffmpeg` in PATH
 - OpenVINO runtime
-- Ollama running locally with `qwen2.5:3b`
+- Ollama with `qwen2.5:3b`
 
-## Quick start
+## Build and Run
 
 Install dependencies:
 
@@ -63,38 +70,36 @@ Install dependencies:
 python build.py setup
 ```
 
-Run checks:
+Checks:
 
 ```powershell
 python build.py check
 ```
 
-Build frontend:
+Frontend production build:
 
 ```powershell
 python build.py build
 ```
 
-Run dev stack (`api + worker + vite`):
+Dev stack (`api + worker + vite dev`):
 
 ```powershell
 python build.py run
 ```
 
-## Production run from one command
-
-Use the new force pipeline:
+### One-command production pipeline
 
 ```powershell
 python build.py force
 ```
 
-Flow:
+`force` order:
 
-1. Pre-check (when deps are already present)
-2. Smart install of missing/invalid deps
-3. Strict check + frontend build
-4. Production host (`uvicorn + worker`, frontend served from compiled `frontend/dist` via FastAPI)
+1. pre-check
+2. smart install missing/invalid dependencies
+3. strict checks + frontend build
+4. production host (`uvicorn + worker`, frontend served from compiled `frontend/dist` by FastAPI)
 
 Clean reinstall variant:
 
@@ -102,57 +107,72 @@ Clean reinstall variant:
 python build.py force --clean
 ```
 
-## API
+## API (V3)
 
-- `POST /api/v1/jobs` - upload + create job
-- `GET /api/v1/jobs` - storage/library list
-- `GET /api/v1/jobs/capabilities/formats` - curated + all ffmpeg muxers
-- `GET /api/v1/jobs/{job_id}` - status/progress/runtime
-- `GET /api/v1/jobs/{job_id}/artifacts` - artifacts list
-- `GET /api/v1/jobs/{job_id}/people` - people profiles
-- `GET /api/v1/jobs/{job_id}/report` - generated report
-- `POST /api/v1/jobs/{job_id}/export` - ZIP bundle build
-- `GET /api/v1/jobs/{job_id}/artifacts/{artifact_name}/download` - artifact download
-- `WS /api/v1/jobs/ws/upload` - chunked upload channel
+Core:
 
-## OpenVINO model paths
+- `POST /api/v1/jobs`
+- `GET /api/v1/jobs`
+- `GET /api/v1/jobs/capabilities/formats`
+- `GET /api/v1/jobs/{job_id}`
+- `GET /api/v1/jobs/{job_id}/artifacts`
+- `GET /api/v1/jobs/{job_id}/people`
+- `GET /api/v1/jobs/{job_id}/report`
+- `POST /api/v1/jobs/{job_id}/export`
+- `GET /api/v1/jobs/{job_id}/artifacts/{artifact_name}/download`
+- `WS /api/v1/jobs/ws/upload`
 
-Priority search paths are controlled by env var `NEWTONSPECT_OPENVINO_MODEL_PATHS`.
-By default it includes:
+V3 analytics/editor:
+
+- `GET /api/v1/jobs/{job_id}/chapters`
+- `GET /api/v1/jobs/{job_id}/quotes`
+- `GET /api/v1/jobs/{job_id}/quality`
+- `GET /api/v1/jobs/{job_id}/comparison`
+- `GET /api/v1/jobs/{job_id}/subtitles`
+- `PUT /api/v1/jobs/{job_id}/subtitles`
+- `GET /api/v1/jobs/{job_id}/translations`
+- `GET /api/v1/jobs/{job_id}/fact-check`
+- `POST /api/v1/jobs/{job_id}/shorts`
+
+Global registries:
+
+- `GET /api/v1/glossary`
+- `POST /api/v1/glossary`
+- `DELETE /api/v1/glossary/{term_id}`
+- `GET /api/v1/person-registry`
+- `POST /api/v1/person-registry/merge`
+- `POST /api/v1/person-registry/split`
+- `GET /api/v1/kb/status`
+- `POST /api/v1/kb/reindex`
+
+## OpenVINO Model Paths
+
+Priority model root can be configured with:
+
+- `NEWTONSPECT_OPENVINO_MODEL_PATHS`
+
+Default includes:
 
 - `C:\Projects\FAI_NCS2_WS\FAI_NCS2_WS\models\intel`
 - `<storage>/models/openvino`
 
-Supported mask/people model family includes:
+## Hugging Face on Windows (optional quality-of-life)
 
-- `person-detection-retail-0013`
-- `person-reidentification-retail-0277`
-- `face-detection-retail-0004` / `0005`
-- `facial-landmarks-35-adas-0002`
-- `facial-landmarks-98-detection-0001`
-- `face-reidentification-retail-0095`
-- `face-recognition-resnet100-arcface-onnx` (if present)
-- `age-gender-recognition-retail-0013`
-- `emotions-recognition-retail-0003`
-- `human-pose-estimation-0001`
-
-## Hugging Face warnings on Windows
-
-For higher rate limits and faster model downloads set:
+For higher HF Hub limits:
 
 - `HF_TOKEN=<your_token>`
 
-Symlink cache warning can be addressed by either:
+Symlink warning mitigation:
 
-1. Enabling Windows Developer Mode
-2. Running Python as Administrator
-3. Or silencing warning text:
+1. Enable Windows Developer Mode, or
+2. Run Python as Administrator, or
+3. Silence warning:
 
 ```powershell
 setx HF_HUB_DISABLE_SYMLINKS_WARNING 1
 ```
 
-## Main env vars
+## Main Environment Variables
 
 - `NEWTONSPECT_STORAGE_ROOT`
 - `NEWTONSPECT_DB_PATH`
@@ -164,7 +184,7 @@ setx HF_HUB_DISABLE_SYMLINKS_WARNING 1
 - `NEWTONSPECT_OPENVINO_DEVICES`
 - `NEWTONSPECT_FRONTEND_DIST_DIR`
 
-## Tests
+## Test
 
 ```powershell
 python build.py check

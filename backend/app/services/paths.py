@@ -9,8 +9,10 @@ class StorageService:
         self.storage_root = storage_root
         self.uploads_dir = self.storage_root / "uploads"
         self.jobs_dir = self.storage_root / "jobs"
+        self.kb_dir = self.storage_root / "kb"
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.kb_dir.mkdir(parents=True, exist_ok=True)
 
     def job_dir(self, job_id: str) -> Path:
         path = self.jobs_dir / job_id
@@ -37,3 +39,8 @@ class StorageService:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def job_shorts_dir(self, job_id: str) -> Path:
+        return self.job_stage_dir(job_id, "shorts")
+
+    def job_chapters_quotes_quality_dir(self, job_id: str) -> Path:
+        return self.job_stage_dir(job_id, "chapters_quotes_quality")

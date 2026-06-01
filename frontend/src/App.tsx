@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import {
   artifactDownloadUrl,
+  buildShorts,
   createJobChunked,
+  deleteGlossary,
+  fetchChapters,
+  fetchComparison,
+  fetchFactCheck,
   downloadArtifact,
   fetchArtifactBlob,
   fetchArtifactText,
@@ -10,26 +15,61 @@ import {
   fetchFormatCapabilities,
   fetchJob,
   fetchJobLibrary,
+  fetchKnowledgeBaseStatus,
   fetchPeople,
+  fetchPersonRegistry,
+  fetchQuality,
+  fetchQuotes,
   fetchReport,
+  fetchSubtitles,
+  fetchTranslations,
   jobUploadWebSocketUrl,
+  listGlossary,
+  mergePersonRegistry,
+  reindexKnowledgeBase,
   requestExportBundle,
+  splitPersonRegistry,
+  updateSubtitles,
+  upsertGlossary,
   type UploadProgress
 } from './api'
 import type {
   Artifact,
+  Chapter,
+  FactCheckItem,
   FormatCapabilitiesResponse,
+  GlossaryTerm,
   JobView,
+  KnowledgeBaseStatus,
+  KeyQuote,
   PersonProfile,
+  PersonRegistryEntry,
+  QualityScore,
+  RunComparison,
   StageRuntime,
+  SubtitleRevision,
+  TranscriptSegment,
+  TranslationTrack,
   VideoReport
 } from './types'
 
 type Locale = 'ru' | 'en'
-type ResultTab = 'subtitles' | 'video' | 'people' | 'summary' | 'storage'
+type ResultTab =
+  | 'subtitles'
+  | 'video'
+  | 'people'
+  | 'summary'
+  | 'chapters'
+  | 'quotes'
+  | 'compare'
+  | 'quality'
+  | 'glossary'
+  | 'kb'
+  | 'storage'
 type QualityPreset = 'max_quality' | 'balanced' | 'max_speed'
 type StreamingMode = 'dual_pass_hq' | 'final_only_hq' | 'live_only_fast'
 type SubtitleEmbedMode = 'auto' | 'embedded' | 'sidecar' | 'burned'
+type PrivacyMode = 'auto_risk' | 'enabled' | 'disabled'
 
 interface SubtitleCue {
   start: number
@@ -109,7 +149,28 @@ const SUBTITLE_MODE_OPTIONS: Array<{ value: SubtitleEmbedMode; ru: string; en: s
   { value: 'burned', ru: 'Хардсаб (burned)', en: 'Burned-in' }
 ]
 
-const TAB_ORDER: ResultTab[] = ['subtitles', 'video', 'people', 'summary', 'storage']
+const PRIVACY_MODE_OPTIONS: Array<{ value: PrivacyMode; ru: string; en: string }> = [
+  { value: 'auto_risk', ru: 'Auto-risk', en: 'Auto-risk' },
+  { value: 'enabled', ru: 'Всегда включен', en: 'Always enabled' },
+  { value: 'disabled', ru: 'Отключен', en: 'Disabled' }
+]
+
+const TRANSLATION_LANGUAGE_OPTIONS = ['en', 'es', 'de', 'fr'] as const
+const PLATFORM_PRESET_OPTIONS = ['youtube', 'tiktok', 'vk', 'telegram'] as const
+
+const TAB_ORDER: ResultTab[] = [
+  'subtitles',
+  'video',
+  'people',
+  'summary',
+  'chapters',
+  'quotes',
+  'compare',
+  'quality',
+  'glossary',
+  'kb',
+  'storage'
+]
 
 const TAB_LABELS: Record<Locale, Record<ResultTab, string>> = {
   ru: {
@@ -117,6 +178,12 @@ const TAB_LABELS: Record<Locale, Record<ResultTab, string>> = {
     video: 'Video Export',
     people: 'People',
     summary: 'AI Summary',
+    chapters: 'Chapters',
+    quotes: 'Quotes',
+    compare: 'Compare',
+    quality: 'Quality',
+    glossary: 'Glossary',
+    kb: 'Knowledge Base',
     storage: 'Storage'
   },
   en: {
@@ -124,6 +191,12 @@ const TAB_LABELS: Record<Locale, Record<ResultTab, string>> = {
     video: 'Video Export',
     people: 'People',
     summary: 'AI Summary',
+    chapters: 'Chapters',
+    quotes: 'Quotes',
+    compare: 'Compare',
+    quality: 'Quality',
+    glossary: 'Glossary',
+    kb: 'Knowledge Base',
     storage: 'Storage'
   }
 }
@@ -302,6 +375,19 @@ export default function App() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [people, setPeople] = useState<PersonProfile[]>([])
   const [report, setReport] = useState<VideoReport | null>(null)
+  const [chapters, setChapters] = useState<Chapter[]>([])
+  const [quotes, setQuotes] = useState<KeyQuote[]>([])
+  const [quality, setQuality] = useState<QualityScore | null>(null)
+  const [comparison, setComparison] = useState<RunComparison | null>(null)
+  const [translations, setTranslations] = useState<TranslationTrack[]>([])
+  const [factCheckItems, setFactCheckItems] = useState<FactCheckItem[]>([])
+  const [subtitleEditorSegments, setSubtitleEditorSegments] = useState<TranscriptSegment[]>([])
+  const [subtitleRevisions, setSubtitleRevisions] = useState<SubtitleRevision[]>([])
+  const [glossaryTerms, setGlossaryTerms] = useState<GlossaryTerm[]>([])
+  const [personRegistry, setPersonRegistry] = useState<PersonRegistryEntry[]>([])
+  const [kbStatus, setKbStatus] = useState<KnowledgeBaseStatus | null>(null)
+  const [glossarySource, setGlossarySource] = useState('')
+  const [glossaryTarget, setGlossaryTarget] = useState('')
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -322,6 +408,21 @@ export default function App() {
   const [showFaceMaskPreview, setShowFaceMaskPreview] = useState(false)
   const [outputVideoFormat, setOutputVideoFormat] = useState('mp4')
   const [subtitleEmbedMode, setSubtitleEmbedMode] = useState<SubtitleEmbedMode>('auto')
+  const [privacyMode, setPrivacyMode] = useState<PrivacyMode>('auto_risk')
+  const [generateShorts, setGenerateShorts] = useState(false)
+  const [shortsClipCount, setShortsClipCount] = useState(3)
+  const [shortsClipDurationSeconds, setShortsClipDurationSeconds] = useState(35)
+  const [translateLanguages, setTranslateLanguages] = useState<string[]>(['en', 'es', 'de', 'fr'])
+  const [enableFactCheck, setEnableFactCheck] = useState(true)
+  const [enableChapters, setEnableChapters] = useState(true)
+  const [enableQuotes, setEnableQuotes] = useState(true)
+  const [enableQualityScore, setEnableQualityScore] = useState(true)
+  const [platformPresets, setPlatformPresets] = useState<string[]>([
+    'youtube',
+    'tiktok',
+    'vk',
+    'telegram'
+  ])
   const [selectedExportFormats, setSelectedExportFormats] = useState<string[]>([
     'srt',
     'vtt',
@@ -405,16 +506,43 @@ export default function App() {
   }, [])
 
   const hydrateJobMaterials = useCallback(async (jobId: string) => {
-    const [freshJob, freshArtifacts, freshPeople, freshReport] = await Promise.all([
+    const [
+      freshJob,
+      freshArtifacts,
+      freshPeople,
+      freshReport,
+      freshChapters,
+      freshQuotes,
+      freshQuality,
+      freshComparison,
+      freshTranslations,
+      freshFactChecks,
+      subtitlePayload
+    ] = await Promise.all([
       fetchJob(jobId),
       fetchArtifacts(jobId),
       fetchPeople(jobId),
-      fetchReport(jobId)
+      fetchReport(jobId),
+      fetchChapters(jobId),
+      fetchQuotes(jobId),
+      fetchQuality(jobId),
+      fetchComparison(jobId),
+      fetchTranslations(jobId),
+      fetchFactCheck(jobId),
+      fetchSubtitles(jobId)
     ])
     setJob(freshJob)
     setArtifacts(freshArtifacts)
     setPeople(freshPeople)
     setReport(freshReport)
+    setChapters(freshChapters)
+    setQuotes(freshQuotes)
+    setQuality(freshQuality)
+    setComparison(freshComparison)
+    setTranslations(freshTranslations)
+    setFactCheckItems(freshFactChecks)
+    setSubtitleEditorSegments(subtitlePayload.segments)
+    setSubtitleRevisions(subtitlePayload.revisions)
   }, [])
 
   const openJob = useCallback(
@@ -465,6 +593,15 @@ export default function App() {
           (async () => {
             const caps = await fetchFormatCapabilities()
             setFormatCapabilities(caps)
+          })(),
+          (async () => {
+            setGlossaryTerms(await listGlossary())
+          })(),
+          (async () => {
+            setPersonRegistry(await fetchPersonRegistry())
+          })(),
+          (async () => {
+            setKbStatus(await fetchKnowledgeBaseStatus())
           })()
         ])
       } catch (err) {
@@ -493,8 +630,37 @@ export default function App() {
           setJob(nextJob)
           setArtifacts(await fetchArtifacts(selectedJobId))
           if (nextJob.status === 'completed' || nextJob.status === 'failed') {
-            setPeople(await fetchPeople(selectedJobId))
-            setReport(await fetchReport(selectedJobId))
+            const [
+              freshPeople,
+              freshReport,
+              freshChapters,
+              freshQuotes,
+              freshQuality,
+              freshComparison,
+              freshTranslations,
+              freshFactChecks,
+              subtitlePayload
+            ] = await Promise.all([
+              fetchPeople(selectedJobId),
+              fetchReport(selectedJobId),
+              fetchChapters(selectedJobId),
+              fetchQuotes(selectedJobId),
+              fetchQuality(selectedJobId),
+              fetchComparison(selectedJobId),
+              fetchTranslations(selectedJobId),
+              fetchFactCheck(selectedJobId),
+              fetchSubtitles(selectedJobId)
+            ])
+            setPeople(freshPeople)
+            setReport(freshReport)
+            setChapters(freshChapters)
+            setQuotes(freshQuotes)
+            setQuality(freshQuality)
+            setComparison(freshComparison)
+            setTranslations(freshTranslations)
+            setFactCheckItems(freshFactChecks)
+            setSubtitleEditorSegments(subtitlePayload.segments)
+            setSubtitleRevisions(subtitlePayload.revisions)
             await loadLibrary()
           }
         } catch (err) {
@@ -552,7 +718,20 @@ export default function App() {
       outputVideoFormat,
       subtitleEmbedMode,
       subtitleStyle: subtitleStyle as unknown as Record<string, unknown>,
-      exportFormats: selectedExportFormats
+      exportFormats: selectedExportFormats,
+      generateShorts,
+      shortsPreset: {
+        clip_count: shortsClipCount,
+        clip_duration_seconds: shortsClipDurationSeconds
+      },
+      privacyMode,
+      translateLanguages,
+      enableFactCheck,
+      enableChapters,
+      enableQuotes,
+      enableQualityScore,
+      platformPresets,
+      enableLiveDraft: streamingMode !== 'final_only_hq'
     }),
     [
       language,
@@ -572,7 +751,17 @@ export default function App() {
       outputVideoFormat,
       subtitleEmbedMode,
       subtitleStyle,
-      selectedExportFormats
+      selectedExportFormats,
+      generateShorts,
+      shortsClipCount,
+      shortsClipDurationSeconds,
+      privacyMode,
+      translateLanguages,
+      enableFactCheck,
+      enableChapters,
+      enableQuotes,
+      enableQualityScore,
+      platformPresets
     ]
   )
 
@@ -804,7 +993,20 @@ export default function App() {
             show_face_mask_preview: showFaceMaskPreview,
             output_video_format: outputVideoFormat,
             subtitle_embed_mode: subtitleEmbedMode,
-            subtitle_style: subtitleStyle
+            subtitle_style: subtitleStyle,
+            generate_shorts: false,
+            shorts_preset: {
+              clip_count: 3,
+              clip_duration_seconds: 35
+            },
+            privacy_mode: 'auto_risk',
+            translate_languages: ['en', 'es', 'de', 'fr'],
+            enable_fact_check: true,
+            enable_chapters: true,
+            enable_quotes: true,
+            enable_quality_score: true,
+            platform_presets: ['youtube', 'tiktok', 'vk', 'telegram'],
+            enable_live_draft: true
           }
         })
       )
@@ -815,6 +1017,14 @@ export default function App() {
       setArtifacts(createdJob.artifacts)
       setPeople([])
       setReport(null)
+      setChapters([])
+      setQuotes([])
+      setQuality(null)
+      setComparison(null)
+      setTranslations([])
+      setFactCheckItems([])
+      setSubtitleEditorSegments([])
+      setSubtitleRevisions([])
       setActiveTab('video')
       setCameraStatus(tx(locale, 'Видео отправлено. Идет финальный HQ-анализ.', 'Uploaded. Running final HQ analysis.'))
 
@@ -881,6 +1091,14 @@ export default function App() {
       setArtifacts(created.artifacts)
       setPeople([])
       setReport(null)
+      setChapters([])
+      setQuotes([])
+      setQuality(null)
+      setComparison(null)
+      setTranslations([])
+      setFactCheckItems([])
+      setSubtitleEditorSegments([])
+      setSubtitleRevisions([])
       setActiveTab('video')
       setInfo(tx(locale, 'Видео загружено. Началась фоновая обработка.', 'Video uploaded. Background processing started.'))
       await loadLibrary()
@@ -941,6 +1159,104 @@ export default function App() {
       setError((err as Error).message)
     }
   }, [loadLibrary, locale, selectedExportFormats, selectedJobId])
+
+  const handleGlossaryUpsert = useCallback(async () => {
+    clearRuntimeMessages()
+    if (!glossarySource.trim() || !glossaryTarget.trim()) {
+      setError(tx(locale, 'Заполните source и target', 'Provide source and target'))
+      return
+    }
+    try {
+      const items = await upsertGlossary({
+        source: glossarySource.trim(),
+        target: glossaryTarget.trim(),
+        locale: 'global'
+      })
+      setGlossaryTerms(items)
+      setGlossarySource('')
+      setGlossaryTarget('')
+      setInfo(tx(locale, 'Термин добавлен в словарь.', 'Glossary term saved.'))
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [glossarySource, glossaryTarget, locale])
+
+  const handleGlossaryDelete = useCallback(async (termId: string) => {
+    clearRuntimeMessages()
+    try {
+      const items = await deleteGlossary(termId)
+      setGlossaryTerms(items)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [])
+
+  const handleKbReindex = useCallback(async () => {
+    clearRuntimeMessages()
+    try {
+      const statusPayload = await reindexKnowledgeBase()
+      setKbStatus(statusPayload)
+      setInfo(tx(locale, 'Offline KB переиндексирована.', 'Offline KB reindexed.'))
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [locale])
+
+  const handleGenerateShorts = useCallback(async () => {
+    if (!selectedJobId) return
+    clearRuntimeMessages()
+    try {
+      await buildShorts(selectedJobId, shortsClipCount, shortsClipDurationSeconds)
+      setArtifacts(await fetchArtifacts(selectedJobId))
+      setInfo(tx(locale, 'Shorts сгенерированы.', 'Shorts generated.'))
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [locale, selectedJobId, shortsClipCount, shortsClipDurationSeconds])
+
+  const handleSaveSubtitles = useCallback(async () => {
+    if (!selectedJobId) return
+    clearRuntimeMessages()
+    try {
+      const payload = await updateSubtitles(
+        selectedJobId,
+        subtitleEditorSegments,
+        'manual editor save'
+      )
+      setSubtitleEditorSegments(payload.segments)
+      setSubtitleRevisions(payload.revisions)
+      setInfo(tx(locale, 'Субтитры сохранены.', 'Subtitles saved.'))
+      setArtifacts(await fetchArtifacts(selectedJobId))
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [locale, selectedJobId, subtitleEditorSegments])
+
+  const handleMergeFirstTwoRegistry = useCallback(async () => {
+    if (personRegistry.length < 2) return
+    clearRuntimeMessages()
+    try {
+      const updated = await mergePersonRegistry(
+        personRegistry[0].registry_id,
+        personRegistry[1].registry_id
+      )
+      setPersonRegistry(updated)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [personRegistry])
+
+  const handleSplitFirstAlias = useCallback(async () => {
+    const candidate = personRegistry.find((item) => item.aliases.length > 1)
+    if (!candidate) return
+    clearRuntimeMessages()
+    try {
+      const updated = await splitPersonRegistry(candidate.registry_id, candidate.aliases[0])
+      setPersonRegistry(updated)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }, [personRegistry])
 
   const handleOpenLibraryJob = useCallback(
     async (jobId: string) => {
@@ -1112,6 +1428,48 @@ export default function App() {
               </select>
             </div>
 
+            <div className="field">
+              <span>{tx(locale, 'Privacy mode', 'Privacy mode')}</span>
+              <select
+                value={privacyMode}
+                onChange={(event) => setPrivacyMode(event.target.value as PrivacyMode)}
+              >
+                {PRIVACY_MODE_OPTIONS.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {locale === 'ru' ? item.ru : item.en}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="field">
+              <span>{tx(locale, 'Shorts preset', 'Shorts preset')}</span>
+              <div className="style-grid">
+                <label>
+                  {tx(locale, 'Клипы', 'Clips')}
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={shortsClipCount}
+                    onChange={(event) => setShortsClipCount(Math.max(1, Number(event.target.value || 1)))}
+                  />
+                </label>
+                <label>
+                  {tx(locale, 'Длительность (сек)', 'Duration (sec)')}
+                  <input
+                    type="number"
+                    min={10}
+                    max={120}
+                    value={shortsClipDurationSeconds}
+                    onChange={(event) =>
+                      setShortsClipDurationSeconds(Math.max(10, Number(event.target.value || 10)))
+                    }
+                  />
+                </label>
+              </div>
+            </div>
+
             <div className="toggle-grid">
               <label>
                 <input
@@ -1177,6 +1535,98 @@ export default function App() {
                 />
                 {tx(locale, 'Показывать маску лица в превью', 'Show face mask in preview')}
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={generateShorts}
+                  onChange={(event) => setGenerateShorts(event.target.checked)}
+                />
+                {tx(locale, 'Генерировать shorts 9:16', 'Generate 9:16 shorts')}
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={enableFactCheck}
+                  onChange={(event) => setEnableFactCheck(event.target.checked)}
+                />
+                {tx(locale, 'Offline fact-check', 'Offline fact-check')}
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={enableChapters}
+                  onChange={(event) => setEnableChapters(event.target.checked)}
+                />
+                {tx(locale, 'Авто-главы', 'Auto chapters')}
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={enableQuotes}
+                  onChange={(event) => setEnableQuotes(event.target.checked)}
+                />
+                {tx(locale, 'Ключевые цитаты', 'Key quotes')}
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={enableQualityScore}
+                  onChange={(event) => setEnableQualityScore(event.target.checked)}
+                />
+                {tx(locale, 'Quality score', 'Quality score')}
+              </label>
+            </div>
+
+            <div className="field">
+              <span>{tx(locale, 'Переводы', 'Translations')}</span>
+              <div className="chips">
+                {TRANSLATION_LANGUAGE_OPTIONS.map((lang) => {
+                  const active = translateLanguages.includes(lang)
+                  return (
+                    <button
+                      key={lang}
+                      type="button"
+                      className={`chip ${active ? 'active' : ''}`}
+                      onClick={() => {
+                        setTranslateLanguages((prev) => {
+                          if (prev.includes(lang)) {
+                            return prev.filter((item) => item !== lang)
+                          }
+                          return [...prev, lang]
+                        })
+                      }}
+                    >
+                      {lang.toUpperCase()}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="field">
+              <span>{tx(locale, 'Профили экспорта', 'Platform export presets')}</span>
+              <div className="chips">
+                {PLATFORM_PRESET_OPTIONS.map((preset) => {
+                  const active = platformPresets.includes(preset)
+                  return (
+                    <button
+                      key={preset}
+                      type="button"
+                      className={`chip ${active ? 'active' : ''}`}
+                      onClick={() => {
+                        setPlatformPresets((prev) => {
+                          if (prev.includes(preset)) {
+                            return prev.filter((item) => item !== preset)
+                          }
+                          return [...prev, preset]
+                        })
+                      }}
+                    >
+                      {preset}
+                    </button>
+                  )
+                })}
+              </div>
             </div>
 
             <div className="field">
@@ -1453,6 +1903,36 @@ export default function App() {
                   <p>{subtitleCues.slice(0, 5).map((cue) => cue.text).join(' · ')}</p>
                 </div>
               ) : null}
+              {subtitleEditorSegments.length > 0 ? (
+                <div className="subtitle-editor">
+                  <h3>{tx(locale, 'Редактор субтитров', 'Subtitle editor')}</h3>
+                  <div className="subtitle-editor-list">
+                    {subtitleEditorSegments.slice(0, 60).map((segment, index) => (
+                      <label key={`sub-segment-${index}`} className="subtitle-editor-row">
+                        <span>
+                          {formatDuration(segment.start)} - {formatDuration(segment.end)}
+                        </span>
+                        <textarea
+                          value={segment.text}
+                          onChange={(event) => {
+                            const next = [...subtitleEditorSegments]
+                            next[index] = { ...next[index], text: event.target.value }
+                            setSubtitleEditorSegments(next)
+                          }}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <button type="button" className="primary" onClick={() => void handleSaveSubtitles()}>
+                    {tx(locale, 'Сохранить субтитры', 'Save subtitles')}
+                  </button>
+                  {subtitleRevisions.length > 0 ? (
+                    <p className="job-meta">
+                      {tx(locale, 'Последняя ревизия', 'Latest revision')}: {formatDate(subtitleRevisions[0].created_at)}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -1613,8 +2093,179 @@ export default function App() {
                       ))
                     )}
                   </section>
+                  <section>
+                    <h3>{tx(locale, 'Переводы', 'Translations')}</h3>
+                    {translations.length === 0 ? (
+                      <p>{tx(locale, 'Переводы пока не сгенерированы.', 'No translations generated yet.')}</p>
+                    ) : (
+                      <div className="library-grid">
+                        {translations.map((track) => (
+                          <article key={track.language} className="library-card">
+                            <h3>{track.language.toUpperCase()}</h3>
+                            <p>
+                              {tx(locale, 'Сегментов', 'Segments')}: {track.segments.length}
+                            </p>
+                            <p>{track.segments.slice(0, 2).map((seg) => seg.text).join(' ')}</p>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </section>
                 </>
               ) : null}
+            </div>
+          ) : null}
+
+          {activeTab === 'chapters' ? (
+            <div className="grid-list">
+              {chapters.length === 0 ? <p>{tx(locale, 'Главы пока не готовы.', 'Chapters are not ready yet.')}</p> : null}
+              {chapters.map((chapter) => (
+                <article key={chapter.chapter_id} className="library-card">
+                  <h3>{chapter.title}</h3>
+                  <p>
+                    {formatDuration(chapter.start)} - {formatDuration(chapter.end)} · {Math.round(chapter.confidence * 100)}%
+                  </p>
+                </article>
+              ))}
+            </div>
+          ) : null}
+
+          {activeTab === 'quotes' ? (
+            <div className="grid-list">
+              {quotes.length === 0 ? <p>{tx(locale, 'Цитаты пока не готовы.', 'Quotes are not ready yet.')}</p> : null}
+              {quotes.map((quote) => (
+                <article key={quote.quote_id} className="library-card">
+                  <h3>{quote.quote_id}</h3>
+                  <p>{quote.text}</p>
+                  <p>
+                    {formatDuration(quote.start)} - {formatDuration(quote.end)} · score {quote.score.toFixed(2)}
+                  </p>
+                </article>
+              ))}
+              {selectedJobId ? (
+                <button type="button" className="primary" onClick={() => void handleGenerateShorts()}>
+                  {tx(locale, 'Сгенерировать shorts 9:16', 'Generate 9:16 shorts')}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeTab === 'compare' ? (
+            <div className="grid-list">
+              {!comparison ? <p>{tx(locale, 'Сравнение недоступно.', 'Comparison unavailable.')}</p> : null}
+              {comparison ? (
+                <article className="library-card">
+                  <h3>{tx(locale, 'Сравнение с прошлым прогоном', 'Comparison with previous run')}</h3>
+                  <p>{comparison.summary_md}</p>
+                  <p>WER-like delta: {comparison.wer_like_delta.toFixed(4)}</p>
+                  <p>People delta: {comparison.people_delta}</p>
+                  <p>Subtitle coverage delta: {comparison.subtitle_coverage_delta.toFixed(4)}</p>
+                  <p>Speaker stability delta: {comparison.speaker_stability_delta.toFixed(4)}</p>
+                </article>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeTab === 'quality' ? (
+            <div className="grid-list">
+              {!quality ? <p>{tx(locale, 'Оценка качества недоступна.', 'Quality score unavailable.')}</p> : null}
+              {quality ? (
+                <>
+                  <article className="library-card">
+                    <h3>Overall: {(quality.overall * 100).toFixed(1)}%</h3>
+                    <p>ASR: {(quality.asr_confidence * 100).toFixed(1)}%</p>
+                    <p>Subtitles: {(quality.subtitle_coverage * 100).toFixed(1)}%</p>
+                    <p>Speakers: {(quality.speaker_stability * 100).toFixed(1)}%</p>
+                    <p>People: {(quality.people_stability * 100).toFixed(1)}%</p>
+                    <p>Report: {(quality.report_completeness * 100).toFixed(1)}%</p>
+                  </article>
+                  <div className="library-grid">
+                    {quality.speaker_timeline.map((item, idx) => (
+                      <article key={`timeline-${idx}`} className="library-card">
+                        <h3>{item.speaker_ref}</h3>
+                        <p>
+                          {formatDuration(item.start)} - {formatDuration(item.end)} ({item.duration.toFixed(1)}s)
+                        </p>
+                      </article>
+                    ))}
+                  </div>
+                  {factCheckItems.length > 0 ? (
+                    <div className="library-grid">
+                      {factCheckItems.map((item, idx) => (
+                        <article key={`fact-${idx}`} className="library-card">
+                          <h3>{item.status}</h3>
+                          <p>{item.claim}</p>
+                          <p>{item.reason}</p>
+                        </article>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeTab === 'glossary' ? (
+            <div className="grid-list">
+              <div className="field">
+                <span>{tx(locale, 'Source термин', 'Source term')}</span>
+                <input value={glossarySource} onChange={(event) => setGlossarySource(event.target.value)} />
+              </div>
+              <div className="field">
+                <span>{tx(locale, 'Target термин', 'Target term')}</span>
+                <input value={glossaryTarget} onChange={(event) => setGlossaryTarget(event.target.value)} />
+              </div>
+              <button type="button" className="primary" onClick={() => void handleGlossaryUpsert()}>
+                {tx(locale, 'Добавить в словарь', 'Add glossary term')}
+              </button>
+              <div className="library-grid">
+                {glossaryTerms.map((term) => (
+                  <article key={term.term_id} className="library-card">
+                    <h3>{term.source}</h3>
+                    <p>{term.target}</p>
+                    <button type="button" className="secondary compact" onClick={() => void handleGlossaryDelete(term.term_id)}>
+                      {tx(locale, 'Удалить', 'Delete')}
+                    </button>
+                  </article>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {activeTab === 'kb' ? (
+            <div className="grid-list">
+              <article className="library-card">
+                <h3>{tx(locale, 'Offline Knowledge Base', 'Offline Knowledge Base')}</h3>
+                <p>{tx(locale, 'Документы', 'Documents')}: {kbStatus?.documents ?? '--'}</p>
+                <p>{tx(locale, 'Чанки', 'Chunks')}: {kbStatus?.chunks ?? '--'}</p>
+                <p>KB root: {kbStatus?.kb_root ?? '--'}</p>
+                <p>{tx(locale, 'Индекс', 'Indexed at')}: {kbStatus?.indexed_at ? formatDate(kbStatus.indexed_at) : '--'}</p>
+                <button type="button" className="primary" onClick={() => void handleKbReindex()}>
+                  {tx(locale, 'Переиндексировать KB', 'Reindex KB')}
+                </button>
+              </article>
+              <article className="library-card">
+                <h3>{tx(locale, 'Person Registry', 'Person Registry')}</h3>
+                <p>{tx(locale, 'Записей', 'Entries')}: {personRegistry.length}</p>
+                <div className="artifact-actions">
+                  <button type="button" className="secondary compact" onClick={() => void handleMergeFirstTwoRegistry()}>
+                    {tx(locale, 'Merge первых 2', 'Merge first 2')}
+                  </button>
+                  <button type="button" className="secondary compact" onClick={() => void handleSplitFirstAlias()}>
+                    {tx(locale, 'Split alias', 'Split alias')}
+                  </button>
+                </div>
+              </article>
+              <div className="library-grid">
+                {personRegistry.map((entry) => (
+                  <article key={entry.registry_id} className="library-card">
+                    <h3>{entry.display_name}</h3>
+                    <p>aliases: {entry.aliases.join(', ')}</p>
+                    <p>jobs: {entry.linked_job_ids.length}</p>
+                    <p>confidence: {(entry.confidence * 100).toFixed(1)}%</p>
+                  </article>
+                ))}
+              </div>
             </div>
           ) : null}
 

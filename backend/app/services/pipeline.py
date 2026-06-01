@@ -7,17 +7,36 @@ from pathlib import Path
 
 from ..config import Settings
 from ..repository import JobRecord, JobRepository
-from ..schemas import Artifact, TranscriptSegment, VideoReport
+from ..schemas import (
+    Artifact,
+    FactCheckItem,
+    ShortsExport,
+    TranscriptSegment,
+    TranslationTrack,
+    VideoReport,
+)
 from .asr import ASRService
 from .exporter import make_artifact
+from .insights import (
+    apply_glossary_to_segments,
+    build_chapters,
+    build_key_quotes,
+    compute_quality_score,
+    extract_claim_candidates,
+    redact_segments_for_privacy,
+    run_offline_fact_check,
+)
+from .knowledge_base import OfflineKnowledgeBase
 from .mask_overlay import OpenVINOMaskOverlayRenderer
 from .media import MediaService
 from .ollama_client import OllamaClient
 from .openvino_people import OpenVINOPeopleAnalyzer
 from .paths import StorageService
 from .reporting import ReportGenerator
+from .shorts import ShortsGenerator
 from .speaker import ActiveSpeakerAttributor
 from .subtitles import write_subtitle_files
+from .translator import LocalTranslator
 
 
 STAGE_WINDOWS: dict[str, tuple[float, float]] = {
@@ -56,6 +75,11 @@ class PipelineRunner:
         self.report_generator = ReportGenerator(
             OllamaClient(settings.ollama_base_url, settings.ollama_model)
         )
+        self.translator = LocalTranslator(
+            OllamaClient(settings.ollama_base_url, settings.ollama_model)
+        )
+        self.kb = OfflineKnowledgeBase(repository=repository, kb_root=storage.kb_dir)
+        self.shorts_generator = ShortsGenerator(self.media)
         self.mask_renderer = OpenVINOMaskOverlayRenderer(
             settings.openvino_models_dir,
             settings.preferred_openvino_devices,
@@ -67,6 +91,15 @@ class PipelineRunner:
         artifacts: list[Artifact] = self.repository.decode_artifacts(job.artifacts_json)
         input_video = Path(job.input_video_path)
         self.storage.job_dir(job.id)
+        previous = self.repository.previous_job_for_fingerprint(
+            source_fingerprint=job.source_fingerprint,
+            current_job_id=job.id,
+        )
+        self.repository.record_job_run(
+            job_id=job.id,
+            source_fingerprint=job.source_fingerprint,
+            previous_job_id=previous.id if previous else None,
+        )
 
         self.repository.update_job_status(job.id, status="running", progress=0.01, step="ingest")
         self._stage_update(job.id, "ingest", 1.0, "Pipeline started")
@@ -77,12 +110,15 @@ class PipelineRunner:
         report_dir = self.storage.job_stage_dir(job.id, "report")
         exports_dir = self.storage.job_stage_dir(job.id, "exports")
         mask_dir = self.storage.job_stage_dir(job.id, "mask")
+        insights_dir = self.storage.job_chapters_quotes_quality_dir(job.id)
+        shorts_dir = self.storage.job_shorts_dir(job.id)
 
         audio_path = audio_dir / "audio.wav"
         transcript_path = subtitles_dir / "transcript.json"
         srt_path = subtitles_dir / "captions.srt"
         vtt_path = subtitles_dir / "captions.vtt"
         ass_path = subtitles_dir / "captions.ass"
+        privacy_redacted = False
         output_format = (options.output_video_format or "mp4").lower().strip(".")
         if not output_format:
             output_format = "mp4"
@@ -139,11 +175,21 @@ class PipelineRunner:
             options.quality_preset,
             progress_callback=_asr_progress,
         )
+        glossary_pairs = [
+            (item.source, item.target) for item in self.repository.list_glossary_terms()
+        ]
+        segments = apply_glossary_to_segments(segments, glossary_pairs)
+        if options.privacy_mode in {"auto_risk", "enabled"}:
+            redacted_segments, changed = redact_segments_for_privacy(segments)
+            if options.privacy_mode == "enabled" or changed:
+                segments = redacted_segments
+                privacy_redacted = changed
         self._stage_update(job.id, "asr", 1.0, "Transcription completed", eta_seconds=0.0)
         transcript_path.write_text(
             json.dumps([segment.model_dump() for segment in segments], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self.repository.set_subtitle_segments(job.id, segments, editor_device="system", note="auto-asr")
         artifacts.append(
             make_artifact(
                 name=transcript_path.name,
@@ -231,6 +277,9 @@ class PipelineRunner:
             segments = attribution.segments
             if options.enable_subtitles:
                 write_subtitle_files(segments, srt_path=srt_path, vtt_path=vtt_path, ass_path=ass_path)
+            self.repository.set_subtitle_segments(
+                job.id, segments, editor_device="system", note="speaker-attribution"
+            )
             self._stage_update(
                 job.id,
                 "speaker_attribution",
@@ -239,6 +288,9 @@ class PipelineRunner:
             )
         else:
             attribution = type("Attr", (), {"method": "disabled"})()
+            self.repository.set_subtitle_segments(
+                job.id, segments, editor_device="system", note="speaker-disabled"
+            )
             self._stage_update(job.id, "speaker_attribution", 1.0, "Speaker attribution disabled")
 
         extracted_names = self._extract_names_by_person(segments)
@@ -264,10 +316,79 @@ class PipelineRunner:
         for person in vision_result.people:
             person.key_comments = report.people_highlights.get(person.person_id, [])
 
+        chapters = build_chapters(segments) if options.enable_chapters else []
+        quotes = build_key_quotes(segments) if options.enable_quotes else []
+        quality = (
+            compute_quality_score(
+                segments=segments,
+                people=vision_result.people,
+                report=report,
+                transcript_duration=input_duration,
+            )
+            if options.enable_quality_score
+            else compute_quality_score(
+                segments=segments,
+                people=vision_result.people,
+                report=report,
+                transcript_duration=input_duration,
+            )
+        )
+
+        translation_tracks: list[TranslationTrack] = []
+        for language in sorted(set([lang.lower() for lang in options.translate_languages])):
+            translation_tracks.append(self.translator.translate(segments, target_language=language))
+
+        fact_checks: list[FactCheckItem] = []
+        if options.enable_fact_check:
+            claims = extract_claim_candidates(segments)
+            kb_chunks = self.repository.list_kb_chunks()
+            fact_checks = run_offline_fact_check(claims, kb_chunks)
+
+        self.repository.set_chapters(job.id, chapters)
+        self.repository.set_quotes(job.id, quotes)
+        self.repository.set_quality(job.id, quality)
+        self.repository.set_translations(job.id, translation_tracks)
+        self.repository.set_fact_checks(job.id, fact_checks)
+
         report_md_path = report_dir / "report.md"
         report_json_path = report_dir / "report.json"
+        chapters_path = insights_dir / "chapters.json"
+        quotes_path = insights_dir / "quotes.json"
+        quality_path = insights_dir / "quality.json"
+        factcheck_path = insights_dir / "fact_check.json"
+        publication_meta_path = insights_dir / "publication_meta.json"
         report_md_path.write_text(report.summary_md, encoding="utf-8")
         report_json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        chapters_path.write_text(
+            json.dumps([item.model_dump() for item in chapters], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        quotes_path.write_text(
+            json.dumps([item.model_dump() for item in quotes], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        quality_path.write_text(quality.model_dump_json(indent=2), encoding="utf-8")
+        factcheck_path.write_text(
+            json.dumps([item.model_dump() for item in fact_checks], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        publication_meta = {
+            "titles": [
+                (report.key_topics[0] if report.key_topics else "AstraOrpheus Clip"),
+                (chapters[0].title if chapters else "Video Summary"),
+                "AI Highlight Reel",
+            ],
+            "description": report.summary_md[:1200],
+            "chapters": [
+                {"start": item.start, "title": item.title}
+                for item in chapters
+            ],
+            "cover_candidates": [quote.start for quote in quotes[:5]],
+        }
+        publication_meta_path.write_text(
+            json.dumps(publication_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         artifacts.extend(
             [
                 make_artifact(
@@ -282,8 +403,52 @@ class PipelineRunner:
                     path=report_json_path,
                     mime_type="application/json",
                 ),
+                make_artifact(
+                    name=chapters_path.name,
+                    kind="chapters_json",
+                    path=chapters_path,
+                    mime_type="application/json",
+                ),
+                make_artifact(
+                    name=quotes_path.name,
+                    kind="quotes_json",
+                    path=quotes_path,
+                    mime_type="application/json",
+                ),
+                make_artifact(
+                    name=quality_path.name,
+                    kind="quality_json",
+                    path=quality_path,
+                    mime_type="application/json",
+                ),
+                make_artifact(
+                    name=factcheck_path.name,
+                    kind="fact_check_json",
+                    path=factcheck_path,
+                    mime_type="application/json",
+                ),
+                make_artifact(
+                    name=publication_meta_path.name,
+                    kind="publication_meta_json",
+                    path=publication_meta_path,
+                    mime_type="application/json",
+                ),
             ]
         )
+        for track in translation_tracks:
+            translation_path = insights_dir / f"translations_{track.language}.json"
+            translation_path.write_text(
+                track.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            artifacts.append(
+                make_artifact(
+                    name=translation_path.name,
+                    kind="translation_json",
+                    path=translation_path,
+                    mime_type="application/json",
+                )
+            )
         self._stage_update(job.id, "report", 1.0, "Report generated")
 
         for person in vision_result.people:
@@ -393,7 +558,12 @@ class PipelineRunner:
             self._stage_update(job.id, "burned_video", 1.0, "Video export disabled")
 
         # Stage: mask overlay
-        if options.enable_mask_overlay:
+        should_render_mask_overlay = (
+            options.enable_mask_overlay
+            or options.privacy_mode == "enabled"
+            or (options.privacy_mode == "auto_risk" and privacy_redacted)
+        )
+        if should_render_mask_overlay:
             self._stage_update(job.id, "mask_overlay", 0.01, "Rendering OpenVINO mask overlay")
 
             def _mask_progress(done_frames: int, total_frames: int, elapsed: float) -> None:
@@ -439,6 +609,29 @@ class PipelineRunner:
         else:
             self._stage_update(job.id, "mask_overlay", 1.0, "Mask overlay disabled")
 
+        shorts_exports: list[ShortsExport] = []
+        if options.generate_shorts:
+            self.repository.add_event(job.id, "burned_video", "Generating 9:16 shorts", 0.97)
+            shorts_exports = self.shorts_generator.generate(
+                job_id=job.id,
+                input_video=input_video,
+                output_dir=shorts_dir,
+                preset=options.shorts_preset,
+                quotes=quotes,
+                chapters=chapters,
+            )
+            for short in shorts_exports:
+                artifacts.append(
+                    make_artifact(
+                        name=Path(short.path).name,
+                        kind="short_video",
+                        path=Path(short.path),
+                        mime_type="video/mp4",
+                    )
+                )
+        self.repository.set_shorts_exports(job.id, shorts_exports)
+
+        self.repository.upsert_person_registry_from_people(job.id, vision_result.people)
         self.repository.set_people(job.id, vision_result.people)
         self.repository.set_report(job.id, report)
         self.repository.set_artifacts(job.id, artifacts)
@@ -449,7 +642,7 @@ class PipelineRunner:
             "done",
             (
                 f"Completed successfully. OpenVINO device={vision_result.device_used}, "
-                f"speaker_method={attribution.method}, mask_overlay={options.enable_mask_overlay}"
+                f"speaker_method={attribution.method}, mask_overlay={should_render_mask_overlay}"
             ),
             1.0,
         )
