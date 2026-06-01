@@ -50,7 +50,7 @@ from ..schemas import (
     PeopleResponse,
     ReportResponse,
 )
-from ..services.exporter import create_zip_bundle, filter_files_for_formats
+from ..services.exporter import create_zip_bundle, filter_files_for_formats, make_artifact
 from ..services.insights import compare_runs
 from ..services.media import MediaService
 from ..services.shorts import ShortsGenerator

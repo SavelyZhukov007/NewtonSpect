@@ -122,8 +122,9 @@ class PipelineRunner:
         output_format = (options.output_video_format or "mp4").lower().strip(".")
         if not output_format:
             output_format = "mp4"
-        burned_video_path = exports_dir / f"video_burned.{output_format}"
-        embedded_video_path = exports_dir / f"video_subtitled.{output_format}"
+        output_extension = self.media.output_extension(output_format)
+        burned_video_path = exports_dir / f"video_burned.{output_extension}"
+        embedded_video_path = exports_dir / f"video_subtitled.{output_extension}"
 
         # Stage: audio extract
         audio_start = time.perf_counter()
@@ -509,6 +510,7 @@ class PipelineRunner:
                     ass_path=ass_path,
                     output_video=burned_video_path,
                     duration_seconds=video_duration,
+                    container_format=selected_format,
                     progress_callback=_burn_progress,
                 )
                 artifacts.append(

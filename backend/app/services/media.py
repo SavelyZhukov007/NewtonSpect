@@ -15,6 +15,9 @@ class MediaService:
         ("avi", "avi", False, None, "Use sidecar subtitles"),
         ("mpegts", "mpegts", False, None, "Use sidecar subtitles"),
     )
+    FORMAT_EXTENSION_ALIASES: dict[str, str] = {
+        "mpegts": "ts",
+    }
 
     def run_ffmpeg(self, args: list[str], cwd: Path | None = None) -> None:
         cmd = ["ffmpeg", "-y", *args]
@@ -92,24 +95,58 @@ class MediaService:
             for item in self.CURATED_FORMATS
         ]
 
-    def burn_ass_subtitles(self, video_path: Path, ass_path: Path, output_video: Path) -> Path:
+    @classmethod
+    def output_extension(cls, container_format: str | None) -> str:
+        normalized = (container_format or "").lower().strip().lstrip(".")
+        if not normalized:
+            return "mp4"
+        return cls.FORMAT_EXTENSION_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _burn_encode_args(container_format: str) -> list[str]:
+        if container_format == "webm":
+            return [
+                "-c:v",
+                "libvpx-vp9",
+                "-crf",
+                "32",
+                "-b:v",
+                "0",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "128k",
+            ]
+        return [
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-preset",
+            "medium",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+        ]
+
+    def burn_ass_subtitles(
+        self,
+        video_path: Path,
+        ass_path: Path,
+        output_video: Path,
+        *,
+        container_format: str | None = None,
+    ) -> Path:
         output_video.parent.mkdir(parents=True, exist_ok=True)
+        normalized_format = (container_format or output_video.suffix.lstrip(".") or "mp4").lower()
         self.run_ffmpeg(
             [
                 "-i",
                 str(video_path),
                 "-vf",
                 f"ass={ass_path.name}",
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-preset",
-                "medium",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
+                *self._burn_encode_args(normalized_format),
                 str(output_video),
             ],
             cwd=ass_path.parent,
@@ -164,9 +201,11 @@ class MediaService:
         output_video: Path,
         *,
         duration_seconds: float,
+        container_format: str | None = None,
         progress_callback: Callable[[float, float, float], None] | None = None,
     ) -> Path:
         output_video.parent.mkdir(parents=True, exist_ok=True)
+        normalized_format = (container_format or output_video.suffix.lstrip(".") or "mp4").lower()
         cmd = [
             "ffmpeg",
             "-y",
@@ -175,16 +214,7 @@ class MediaService:
             str(video_path),
             "-vf",
             f"ass={ass_path.name}",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-preset",
-            "medium",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
+            *self._burn_encode_args(normalized_format),
             str(output_video),
         ]
         process = subprocess.Popen(

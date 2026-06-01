@@ -71,9 +71,17 @@ def test_pipeline_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
             raw_markdown="",
         )
 
-    def fake_burn(_video: Path, ass_path: Path, output_video: Path, duration_seconds: float, progress_callback=None) -> Path:
+    def fake_burn(
+        _video: Path,
+        ass_path: Path,
+        output_video: Path,
+        duration_seconds: float,
+        container_format: str | None = None,
+        progress_callback=None,
+    ) -> Path:
         _ = ass_path
         _ = duration_seconds
+        _ = container_format
         if progress_callback:
             progress_callback(2.0, 2.0, 0.0)
         output_video.write_bytes(b"fake mp4")

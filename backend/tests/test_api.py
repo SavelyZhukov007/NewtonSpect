@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.schemas import Artifact
+from app.schemas import Artifact, ShortsExport
 
 
 def test_create_job_and_fetch(tmp_path: Path, monkeypatch) -> None:
@@ -116,3 +116,58 @@ def test_download_artifact_headers(tmp_path: Path, monkeypatch) -> None:
     assert "attachment;" in disposition
     assert "filename=" in disposition
     assert "filename*=" in disposition
+
+
+def test_build_shorts_endpoint_returns_artifacts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NEWTONSPECT_STORAGE_ROOT", str(tmp_path / "storage"))
+    monkeypatch.setenv("NEWTONSPECT_DB_PATH", str(tmp_path / "storage" / "db.sqlite3"))
+    app = create_app()
+    client = TestClient(app)
+
+    payload = b"\x00\x00\x00\x20ftypisom\x00\x00\x00\x00isomiso2"
+    created = client.post(
+        "/api/v1/jobs",
+        files={"video": ("demo.mp4", payload, "video/mp4")},
+    )
+    assert created.status_code == 200, created.text
+    job_id = created.json()["job"]["id"]
+
+    def fake_generate(
+        self,
+        *,
+        job_id: str,
+        input_video: Path,
+        output_dir: Path,
+        preset,
+        quotes,
+        chapters,
+    ):
+        _ = (self, input_video, preset, quotes, chapters)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        short_path = output_dir / "short_01.mp4"
+        short_path.write_bytes(b"short")
+        return [
+            ShortsExport(
+                short_id="short-1",
+                job_id=job_id,
+                label="Short 1",
+                path=str(short_path),
+                start=0.0,
+                end=10.0,
+                created_at=datetime.now(timezone.utc),
+            )
+        ]
+
+    monkeypatch.setattr("app.api.jobs.ShortsGenerator.generate", fake_generate)
+
+    response = client.post(
+        f"/api/v1/jobs/{job_id}/shorts",
+        json={"clip_count": 1, "clip_duration_seconds": 10},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert len(data["shorts"]) == 1
+
+    artifacts_response = client.get(f"/api/v1/jobs/{job_id}/artifacts")
+    assert artifacts_response.status_code == 200
+    assert any(item["kind"] == "short_video" for item in artifacts_response.json()["artifacts"])
